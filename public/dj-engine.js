@@ -260,10 +260,11 @@ class DJEngine {
 
   /**
    * Match BPMs between decks using playback rate adjustment.
+   * YouTube IFrame API only supports discrete rates: 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2
    */
   _matchBPMs(fromDeck, toDeck, transition) {
-    // Calculate the rate adjustment needed
-    // We adjust the incoming track to match the outgoing track's tempo
+    const YOUTUBE_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
     const fromBpm = transition.fromBpm;
     const toBpm = transition.toBpm;
 
@@ -277,18 +278,26 @@ class DJEngine {
       targetBpm = fromBpm * 2;
     }
 
-    const rate = targetBpm / toBpm;
+    const idealRate = targetBpm / toBpm;
 
-    // YouTube API limits playback rate. Clamp to safe range.
-    const clampedRate = Math.max(0.5, Math.min(2.0, rate));
+    // Snap to nearest YouTube-supported rate
+    const snappedRate = YOUTUBE_RATES.reduce((best, rate) =>
+      Math.abs(rate - idealRate) < Math.abs(best - idealRate) ? rate : best
+    );
 
-    if (Math.abs(clampedRate - 1.0) > 0.01) {
-      this.playbackRate[toDeck] = clampedRate;
+    // Only apply if the snapped rate actually helps (within 4% of target)
+    const effectiveBpm = toBpm * snappedRate;
+    const bpmError = Math.abs(effectiveBpm - targetBpm) / targetBpm;
+
+    if (snappedRate !== 1 && bpmError < 0.04) {
+      this.playbackRate[toDeck] = snappedRate;
       const player = this.players[toDeck];
       if (player?.setPlaybackRate) {
-        player.setPlaybackRate(clampedRate);
-        this._log('beat', `BPM match: ${toDeck.toUpperCase()} rate=${clampedRate.toFixed(3)} (${toBpm} -> ${targetBpm.toFixed(1)} BPM)`);
+        player.setPlaybackRate(snappedRate);
+        this._log('beat', `BPM match: ${toDeck.toUpperCase()} rate=${snappedRate} (${toBpm} -> ${effectiveBpm.toFixed(1)} BPM, target=${targetBpm.toFixed(1)}, err=${(bpmError*100).toFixed(1)}%)`);
       }
+    } else if (snappedRate !== 1) {
+      this._log('warn', `BPM match skipped: best rate ${snappedRate} gives ${(bpmError*100).toFixed(1)}% error (${toBpm} -> ${effectiveBpm.toFixed(1)} vs target ${targetBpm.toFixed(1)})`);
     }
   }
 

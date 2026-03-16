@@ -189,24 +189,40 @@ function planTransition(from, to) {
   const bpmDiff = Math.abs(from.bpm - to.bpm);
   const bpmRatio = from.bpm / to.bpm;
 
+  // YouTube only supports these discrete playback rates
+  const YOUTUBE_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
+  // Check if tempo matching is feasible with YouTube's discrete rates
+  const idealRate = from.bpm / to.bpm;
+  const bestRate = YOUTUBE_RATES.reduce((best, rate) =>
+    Math.abs(rate - idealRate) < Math.abs(best - idealRate) ? rate : best
+  );
+  const rateError = Math.abs((to.bpm * bestRate) - from.bpm) / from.bpm;
+  const canTempoMatch = rateError < 0.04; // Within 4%
+
   // Determine transition type
   let type, duration, technique;
 
   if (bpmDiff < 3) {
-    // Very close BPMs - long smooth blend
+    // Very close BPMs - long smooth blend (no rate change needed)
     type = 'smooth';
     duration = 16; // 16 beats
     technique = 'crossfade with beat sync';
-  } else if (bpmDiff < 8) {
-    // Moderate difference - blend with tempo adjustment
+  } else if (bpmDiff < 8 && canTempoMatch) {
+    // Moderate difference but rate-matchable - blend with tempo adjustment
     type = 'blend';
     duration = 8;
-    technique = 'crossfade with gradual tempo shift';
-  } else if (bpmRatio > 1.9 && bpmRatio < 2.1) {
+    technique = `crossfade with tempo shift (rate=${bestRate})`;
+  } else if ((bpmRatio > 1.9 && bpmRatio < 2.1) || (bpmRatio > 0.48 && bpmRatio < 0.52)) {
     // Double/half time relationship
     type = 'double-time';
     duration = 8;
     technique = 'half-time blend';
+  } else if (bpmDiff < 15) {
+    // Moderate difference, can't rate-match - shorter crossfade to mask it
+    type = 'blend';
+    duration = 4;
+    technique = 'quick crossfade (tempo mismatch too large for rate adjust)';
   } else {
     // Large difference - hard cut on a downbeat
     type = 'cut';
