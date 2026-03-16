@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube DJ</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>YouTube DJ</h1>
+      <div id="playlist-input">
+        <input type="text" id="playlist-url" placeholder="Paste YouTube playlist URL..." />
+        <button id="load-btn" onclick="loadPlaylist()">Load Playlist</button>
+        <button id="demo-btn" onclick="loadDemo()">Demo (Test)</button>
+      </div>
+      <div id="status-bar">
+        <span id="status-text">Ready</span>
+        <div id="progress-bar"><div id="progress-fill"></div></div>
+      </div>
+    </header>
+
+    <main>
+      <!-- DJ Decks -->
+      <div id="decks">
+        <div class="deck" id="deck-a">
+          <div class="deck-label">DECK A</div>
+          <div class="deck-video">
+            <div id="player-a"></div>
+          </div>
+          <div class="deck-info">
+            <div class="track-title" id="title-a">-</div>
+            <div class="track-meta">
+              <span class="bpm" id="bpm-a">-- BPM</span>
+              <span class="key" id="key-a">--</span>
+            </div>
+            <div class="deck-time">
+              <span id="time-a">0:00</span> / <span id="duration-a">0:00</span>
+            </div>
+          </div>
+          <div class="deck-controls">
+            <input type="range" class="volume-slider" id="vol-a" min="0" max="100" value="100"
+              oninput="setVolume('a', this.value)" />
+            <label>Vol</label>
+          </div>
+        </div>
+
+        <div id="mixer">
+          <div id="crossfader-container">
+            <label>Crossfader</label>
+            <input type="range" id="crossfader" min="0" max="100" value="0"
+              oninput="setCrossfade(this.value)" />
+            <div class="crossfade-labels"><span>A</span><span>B</span></div>
+          </div>
+          <div id="mix-controls">
+            <button onclick="startAutoMix()" id="automix-btn">AUTO MIX</button>
+            <button onclick="triggerTransition()" id="transition-btn">TRANSITION NOW</button>
+            <button onclick="stopMix()" id="stop-btn">STOP</button>
+          </div>
+          <div id="transition-info">
+            <div id="transition-type">-</div>
+            <div id="transition-countdown"></div>
+          </div>
+        </div>
+
+        <div class="deck" id="deck-b">
+          <div class="deck-label">DECK B</div>
+          <div class="deck-video">
+            <div id="player-b"></div>
+          </div>
+          <div class="deck-info">
+            <div class="track-title" id="title-b">-</div>
+            <div class="track-meta">
+              <span class="bpm" id="bpm-b">-- BPM</span>
+              <span class="key" id="key-b">--</span>
+            </div>
+            <div class="deck-time">
+              <span id="time-b">0:00</span> / <span id="duration-b">0:00</span>
+            </div>
+          </div>
+          <div class="deck-controls">
+            <input type="range" class="volume-slider" id="vol-b" min="0" max="100" value="100"
+              oninput="setVolume('b', this.value)" />
+            <label>Vol</label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Track List / Queue -->
+      <div id="track-panel">
+        <div id="track-list-header">
+          <h2>Playlist</h2>
+          <button onclick="analyzeAll()" id="analyze-btn">Analyze All</button>
+          <button onclick="toggleDebug()" id="debug-toggle">Debug Panel</button>
+        </div>
+        <div id="track-list"></div>
+      </div>
+
+      <!-- Debug Panel -->
+      <div id="debug-panel" class="hidden">
+        <h2>Mix Debug Tools</h2>
+        <div id="debug-tabs">
+          <button class="debug-tab active" onclick="showDebugTab('bpm')">BPM Analysis</button>
+          <button class="debug-tab" onclick="showDebugTab('beats')">Beat Grid</button>
+          <button class="debug-tab" onclick="showDebugTab('energy')">Energy Map</button>
+          <button class="debug-tab" onclick="showDebugTab('transitions')">Transitions</button>
+          <button class="debug-tab" onclick="showDebugTab('mix-log')">Mix Log</button>
+        </div>
+        <div id="debug-content">
+          <div id="debug-bpm" class="debug-section">
+            <canvas id="bpm-canvas" width="800" height="200"></canvas>
+            <div id="bpm-details"></div>
+          </div>
+          <div id="debug-beats" class="debug-section hidden">
+            <canvas id="beat-canvas" width="800" height="300"></canvas>
+            <div id="beat-details"></div>
+          </div>
+          <div id="debug-energy" class="debug-section hidden">
+            <canvas id="energy-canvas" width="800" height="200"></canvas>
+          </div>
+          <div id="debug-transitions" class="debug-section hidden">
+            <div id="transition-list"></div>
+          </div>
+          <div id="debug-mix-log" class="debug-section hidden">
+            <div id="mix-log"></div>
+            <button onclick="clearMixLog()">Clear Log</button>
+            <button onclick="exportMixLog()">Export Log</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="dj-engine.js"></script>
+  <script src="debug-tools.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

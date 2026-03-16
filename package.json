@@ -1,0 +1,16 @@
+{
+  "name": "youtube-dj",
+  "version": "1.0.0",
+  "description": "YouTube DJ Mixer - Beat-matched mixing of YouTube music videos",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "analyze": "python3 server/analyze.py"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "ws": "^8.16.0"
+  }
+}
