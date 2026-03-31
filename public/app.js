@@ -1,6 +1,6 @@
 /**
- * YouTube DJ - Main Application
- * Ties together the DJ engine, YouTube players, and UI.
+ * YouTube DJ - Main Application (Hybrid Audio Mode)
+ * Ties together the DJ engine, YouTube players, AudioDecks, and UI.
  */
 
 let engine;
@@ -8,6 +8,9 @@ let debug;
 let playlist = [];
 let analysisData = {};
 let ytReady = false;
+
+// Waveform rendering contexts
+let waveformCtx = { a: null, b: null };
 
 // YouTube IFrame API callback
 function onYouTubeIframeAPIReady() {
@@ -31,7 +34,7 @@ function initPlayers() {
     events: {
       onReady: () => {
         engine.setPlayer('a', playerA);
-        setStatus('Players ready');
+        setStatus('Players ready (hybrid audio mode)');
       },
       onStateChange: (e) => onPlayerStateChange('a', e),
     }
@@ -57,9 +60,8 @@ function initPlayers() {
 }
 
 function onPlayerStateChange(deck, event) {
-  // YT states: -1=unstarted, 0=ended, 1=playing, 2=paused, 3=buffering, 5=cued
   const states = { '-1': 'unstarted', 0: 'ended', 1: 'playing', 2: 'paused', 3: 'buffering', 5: 'cued' };
-  debug.log({ time: new Date().toISOString(), type: 'info', message: `Deck ${deck.toUpperCase()} state: ${states[event.data] || event.data}` });
+  debug.log({ time: new Date().toISOString(), type: 'info', message: `Deck ${deck.toUpperCase()} video state: ${states[event.data] || event.data}` });
 }
 
 // Initialize engine and debug tools
@@ -100,24 +102,117 @@ engine.onUpdate = (event, data) => {
 engine.init();
 debug.init();
 
-// UI update loop
+// Set up waveform canvases
+function initWaveformCanvases() {
+  for (const deck of ['a', 'b']) {
+    const canvas = document.getElementById(`waveform-${deck}`);
+    if (canvas) {
+      waveformCtx[deck] = canvas.getContext('2d');
+    }
+  }
+}
+
+// Render real-time waveform from AnalyserNode
+function renderWaveform(deck) {
+  const ctx = waveformCtx[deck];
+  const audioDeck = engine.audioDecks[deck];
+  if (!ctx || !audioDeck?.isPlaying()) {
+    // Clear canvas if not playing
+    if (ctx) {
+      const canvas = ctx.canvas;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#0d1117';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    return;
+  }
+
+  const canvas = ctx.canvas;
+  const data = audioDeck.getWaveformData();
+  const bufferLength = data.length;
+
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const color = deck === 'a' ? '#58a6ff' : '#e94560';
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+
+  const sliceWidth = canvas.width / bufferLength;
+  let x = 0;
+
+  for (let i = 0; i < bufferLength; i++) {
+    const v = data[i] / 128.0;
+    const y = (v * canvas.height) / 2;
+
+    if (i === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+    x += sliceWidth;
+  }
+
+  ctx.lineTo(canvas.width, canvas.height / 2);
+  ctx.stroke();
+
+  // Draw center line
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  ctx.moveTo(0, canvas.height / 2);
+  ctx.lineTo(canvas.width, canvas.height / 2);
+  ctx.stroke();
+}
+
+// Update level meter
+function updateLevelMeter(deck) {
+  const audioDeck = engine.audioDecks[deck];
+  const el = document.getElementById(`level-${deck}`);
+  if (!el || !audioDeck) return;
+
+  if (audioDeck.isPlaying()) {
+    const rms = audioDeck.getRMSLevel();
+    // Scale RMS (typically 0-0.5) to percentage
+    const pct = Math.min(100, rms * 300);
+    el.style.height = `${pct}%`;
+  } else {
+    el.style.height = '0%';
+  }
+}
+
+// UI update loop (uses audio timing, not YouTube)
 setInterval(() => {
   for (const deck of ['a', 'b']) {
-    const player = engine.players[deck];
-    if (!player || typeof player.getCurrentTime !== 'function') continue;
-    const time = player.getCurrentTime();
-    const dur = player.getDuration?.() || 0;
+    const audioDeck = engine.audioDecks[deck];
+    if (!audioDeck) continue;
+
+    const time = audioDeck.getCurrentTime();
+    const dur = audioDeck.getDuration();
     document.getElementById(`time-${deck}`).textContent = formatTime(time);
     document.getElementById(`duration-${deck}`).textContent = formatTime(dur);
+
+    // Update playback rate display
+    const rateEl = document.getElementById(`rate-${deck}`);
+    if (rateEl) {
+      const rate = audioDeck.audio.playbackRate;
+      rateEl.textContent = `${rate.toFixed(3)}x`;
+      rateEl.style.color = Math.abs(rate - 1.0) > 0.001 ? '#f0883e' : '#484f58';
+    }
+
+    // Render waveform and level meter
+    renderWaveform(deck);
+    updateLevelMeter(deck);
   }
 
   // Update transition countdown
   if (engine.autoMixing && engine.mixPlan) {
     const trans = engine.mixPlan.transitions[engine.queueIndex];
     if (trans) {
-      const player = engine.players[engine.activeDeck];
-      if (player && typeof player.getCurrentTime === 'function') {
-        const remaining = trans.fromOutPoint - player.getCurrentTime();
+      const audioDeck = engine.audioDecks[engine.activeDeck];
+      if (audioDeck) {
+        const remaining = trans.fromOutPoint - audioDeck.getCurrentTime();
         if (remaining > 0) {
           document.getElementById('transition-countdown').textContent =
             `Next transition in ${Math.ceil(remaining)}s`;
@@ -127,7 +222,7 @@ setInterval(() => {
       }
     }
   }
-}, 200);
+}, 50); // 20fps for smooth waveform rendering
 
 // ---- UI Functions ----
 
@@ -213,7 +308,6 @@ async function loadPlaylist() {
 }
 
 function loadDemo() {
-  // Demo with some well-known video IDs for testing
   playlist = [
     { id: 'dQw4w9WgXcQ', title: 'Rick Astley - Never Gonna Give You Up', duration: 213 },
     { id: 'fJ9rUzIMcZQ', title: 'Queen - Bohemian Rhapsody', duration: 354 },
@@ -259,7 +353,6 @@ function renderTrackList() {
 function selectTrackInList(videoId) {
   if (analysisData[videoId]) {
     debug.selectTrack(videoId);
-    // Show debug panel if hidden
     const panel = document.getElementById('debug-panel');
     if (panel.classList.contains('hidden')) {
       panel.classList.remove('hidden');
@@ -278,7 +371,6 @@ async function analyzeAll() {
   setProgress(5);
   document.getElementById('analyze-btn').disabled = true;
 
-  // Mark tracks as analyzing
   document.querySelectorAll('.status-badge').forEach(el => {
     if (el.classList.contains('pending')) {
       el.classList.remove('pending');
@@ -301,7 +393,6 @@ async function analyzeAll() {
 
     const data = await res.json();
 
-    // Store analysis results
     for (const track of data.tracks) {
       if (!track.error) {
         analysisData[track.video_id] = track;
@@ -328,17 +419,15 @@ async function analyzeAll() {
         const plan = await planRes.json();
         engine.setMixPlan(plan);
 
-        // Reorder track list to match plan
         const orderedPlaylist = plan.order.map(id =>
           playlist.find(t => t.id === id) || { id, title: id }
         );
         playlist = orderedPlaylist;
         renderTrackList();
 
-        // Render transition debug info
         debug.renderTransitions(plan, analysisData);
 
-        setStatus(`Ready to mix! ${analyzedTracks.length} tracks analyzed and ordered.`);
+        setStatus(`Ready to mix! ${analyzedTracks.length} tracks analyzed. Hybrid audio mode active.`);
       }
     } else {
       setStatus('Need at least 2 successfully analyzed tracks to create a mix plan.');
@@ -403,4 +492,11 @@ function clearMixLog() {
 
 function exportMixLog() {
   debug.exportLog();
+}
+
+// Initialize waveform canvases when DOM is ready
+document.addEventListener('DOMContentLoaded', initWaveformCanvases);
+// Also try immediately in case DOMContentLoaded already fired
+if (document.readyState !== 'loading') {
+  initWaveformCanvases();
 }

@@ -104,6 +104,42 @@ app.post('/api/analyze', (req, res) => {
   });
 });
 
+// Serve cached audio files for Web Audio API playback
+app.get('/api/audio/:videoId', (req, res) => {
+  const videoId = req.params.videoId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const wavPath = path.join(AUDIO_DIR, `${videoId}.wav`);
+
+  if (!fs.existsSync(wavPath)) {
+    return res.status(404).json({ error: 'Audio not found. Analyze the track first.' });
+  }
+
+  const stat = fs.statSync(wavPath);
+  const range = req.headers.range;
+
+  if (range) {
+    // Support range requests for seeking
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+    const chunkSize = end - start + 1;
+
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': 'audio/wav',
+    });
+    fs.createReadStream(wavPath, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': stat.size,
+      'Content-Type': 'audio/wav',
+      'Accept-Ranges': 'bytes',
+    });
+    fs.createReadStream(wavPath).pipe(res);
+  }
+});
+
 // Get cached analysis for a single track
 app.get('/api/analysis/:videoId', (req, res) => {
   const cachePath = path.join(ANALYSIS_DIR, `${req.params.videoId}.json`);
@@ -189,42 +225,40 @@ function planTransition(from, to) {
   const bpmDiff = Math.abs(from.bpm - to.bpm);
   const bpmRatio = from.bpm / to.bpm;
 
-  // YouTube only supports these discrete playback rates
-  const YOUTUBE_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
-
-  // Check if tempo matching is feasible with YouTube's discrete rates
-  const idealRate = from.bpm / to.bpm;
-  const bestRate = YOUTUBE_RATES.reduce((best, rate) =>
-    Math.abs(rate - idealRate) < Math.abs(best - idealRate) ? rate : best
-  );
-  const rateError = Math.abs((to.bpm * bestRate) - from.bpm) / from.bpm;
-  const canTempoMatch = rateError < 0.04; // Within 4%
+  // With Web Audio API, we can use arbitrary playback rates (not limited to YouTube's discrete set).
+  // Calculate the exact rate needed for perfect BPM matching.
+  const exactRate = from.bpm / to.bpm;
+  // Clamp to reasonable range where pitch artifacts aren't too noticeable
+  const clampedRate = Math.max(0.5, Math.min(2.0, exactRate));
+  const effectiveBpm = to.bpm * clampedRate;
+  const rateError = Math.abs(effectiveBpm - from.bpm) / from.bpm;
+  const canTempoMatch = rateError < 0.001; // Essentially perfect with arbitrary rates
 
   // Determine transition type
   let type, duration, technique;
 
   if (bpmDiff < 3) {
-    // Very close BPMs - long smooth blend (no rate change needed)
+    // Very close BPMs - long smooth blend
     type = 'smooth';
     duration = 16; // 16 beats
     technique = 'crossfade with beat sync';
-  } else if (bpmDiff < 8 && canTempoMatch) {
-    // Moderate difference but rate-matchable - blend with tempo adjustment
+  } else if (bpmDiff < 12 && canTempoMatch) {
+    // Moderate difference - precise tempo match via Web Audio playbackRate
     type = 'blend';
-    duration = 8;
-    technique = `crossfade with tempo shift (rate=${bestRate})`;
+    duration = 12;
+    technique = `beat-matched crossfade (rate=${clampedRate.toFixed(4)})`;
   } else if ((bpmRatio > 1.9 && bpmRatio < 2.1) || (bpmRatio > 0.48 && bpmRatio < 0.52)) {
     // Double/half time relationship
     type = 'double-time';
     duration = 8;
     technique = 'half-time blend';
-  } else if (bpmDiff < 15) {
-    // Moderate difference, can't rate-match - shorter crossfade to mask it
+  } else if (bpmDiff < 20) {
+    // Larger difference but still blendable with rate adjustment
     type = 'blend';
-    duration = 4;
-    technique = 'quick crossfade (tempo mismatch too large for rate adjust)';
+    duration = 6;
+    technique = `tempo-shifted crossfade (rate=${clampedRate.toFixed(4)})`;
   } else {
-    // Large difference - hard cut on a downbeat
+    // Very large difference - hard cut on a downbeat
     type = 'cut';
     duration = 1;
     technique = 'hard cut on downbeat';

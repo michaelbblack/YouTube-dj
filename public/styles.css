@@ -432,6 +432,62 @@ button:disabled { background: #444; cursor: not-allowed; }
 .log-error { color: #e94560; }
 .log-beat { color: #7ee787; }
 
+/* Hybrid audio mode badge */
+.hybrid-badge {
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  background: linear-gradient(90deg, #7ee787, #58a6ff);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  vertical-align: super;
+  margin-left: 8px;
+}
+
+/* Waveform display */
+.deck-waveform {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.deck-waveform canvas {
+  flex: 1;
+  height: 60px;
+  background: #0d1117;
+  border-radius: 4px;
+  border: 1px solid #21262d;
+}
+
+/* Level meter */
+.level-meter {
+  width: 8px;
+  height: 60px;
+  background: #21262d;
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+.level-fill {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  height: 0%;
+  background: linear-gradient(to top, #7ee787, #f0883e, #e94560);
+  border-radius: 4px;
+  transition: height 50ms linear;
+}
+
+/* Rate display */
+.rate-display {
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  color: #f0883e;
+  min-width: 48px;
+  text-align: right;
+}
+
 .hidden { display: none !important; }
 
 /* Beat indicator */

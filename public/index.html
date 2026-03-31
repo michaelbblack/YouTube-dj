@@ -9,7 +9,7 @@
 <body>
   <div id="app">
     <header>
-      <h1>YouTube DJ</h1>
+      <h1>YouTube DJ <span class="hybrid-badge" title="Web Audio API for precise mixing, YouTube for visuals">HYBRID AUDIO</span></h1>
       <div id="playlist-input">
         <input type="text" id="playlist-url" placeholder="Paste YouTube playlist URL..." />
         <button id="load-btn" onclick="loadPlaylist()">Load Playlist</button>
@@ -39,10 +39,17 @@
               <span id="time-a">0:00</span> / <span id="duration-a">0:00</span>
             </div>
           </div>
+          <div class="deck-waveform">
+            <canvas id="waveform-a" width="400" height="60"></canvas>
+            <div class="level-meter">
+              <div class="level-fill" id="level-a"></div>
+            </div>
+          </div>
           <div class="deck-controls">
             <input type="range" class="volume-slider" id="vol-a" min="0" max="100" value="100"
               oninput="setVolume('a', this.value)" />
             <label>Vol</label>
+            <span class="rate-display" id="rate-a">1.000x</span>
           </div>
         </div>
 
@@ -79,10 +86,17 @@
               <span id="time-b">0:00</span> / <span id="duration-b">0:00</span>
             </div>
           </div>
+          <div class="deck-waveform">
+            <canvas id="waveform-b" width="400" height="60"></canvas>
+            <div class="level-meter">
+              <div class="level-fill" id="level-b"></div>
+            </div>
+          </div>
           <div class="deck-controls">
             <input type="range" class="volume-slider" id="vol-b" min="0" max="100" value="100"
               oninput="setVolume('b', this.value)" />
             <label>Vol</label>
+            <span class="rate-display" id="rate-b">1.000x</span>
           </div>
         </div>
       </div>
@@ -133,6 +147,7 @@
   </div>
 
   <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="audio-deck.js"></script>
   <script src="dj-engine.js"></script>
   <script src="debug-tools.js"></script>
   <script src="app.js"></script>

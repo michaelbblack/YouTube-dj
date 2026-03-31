@@ -1,42 +1,74 @@
 /**
- * YouTube DJ Engine
- * Handles dual YouTube player management, beat synchronization,
- * crossfading, and automatic mix transitions.
+ * YouTube DJ Engine - Hybrid Audio Mode
+ *
+ * Uses Web Audio API (via AudioDeck) for precise audio control:
+ *   - Arbitrary playbackRate for exact BPM matching
+ *   - GainNode crossfading (no more YouTube setVolume() at 60fps)
+ *   - AnalyserNode for real-time waveform visualization
+ *
+ * YouTube IFrame players are used ONLY for visuals (muted).
+ * Audio position is the source of truth; YouTube video syncs to it.
  */
 
 class DJEngine {
   constructor() {
+    // YouTube players (visuals only, muted)
     this.players = { a: null, b: null };
+    // Web Audio decks (actual audio playback)
+    this.audioDecks = { a: null, b: null };
+    this.audioContext = null;
+
     this.tracks = {};          // Analysis data keyed by video_id
-    this.activeDeck = 'a';     // Which deck is currently "live"
-    this.queue = [];           // Ordered video IDs to play
+    this.activeDeck = 'a';
+    this.queue = [];           // Ordered video IDs
     this.queueIndex = 0;
-    this.mixPlan = null;       // Server-generated mix plan
+    this.mixPlan = null;
     this.autoMixing = false;
     this.crossfadeValue = 0;   // 0 = full A, 100 = full B
     this.transitioning = false;
     this.transitionTimer = null;
     this.beatTracker = { a: null, b: null };
     this.deckVolumes = { a: 100, b: 100 };
-    this.onUpdate = null;      // Callback for UI updates
-    this.onLog = null;         // Callback for debug logging
+    this.onUpdate = null;
+    this.onLog = null;
     this.playbackRate = { a: 1.0, b: 1.0 };
     this._updateInterval = null;
     this._transitionScheduled = false;
+
+    // Hybrid mode: sync YouTube video to audio position
+    this._syncInterval = null;
+    this._syncThreshold = 0.5; // seconds - re-sync YouTube if drift exceeds this
+
+    // Track which video IDs are loaded on each deck
+    this._deckVideoIds = { a: null, b: null };
   }
 
   init() {
-    // Start the update loop
+    // Create shared AudioContext
+    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    this.audioDecks.a = new AudioDeck('a', this.audioContext);
+    this.audioDecks.b = new AudioDeck('b', this.audioContext);
+
+    // Start update loops
     this._updateInterval = setInterval(() => this._tick(), 50);
+    this._syncInterval = setInterval(() => this._syncVideoToAudio(), 500);
+
+    this._log('info', 'Hybrid audio mode initialized (Web Audio API + YouTube visuals)');
   }
 
   destroy() {
     clearInterval(this._updateInterval);
+    clearInterval(this._syncInterval);
     clearTimeout(this.transitionTimer);
+    this.audioDecks.a?.destroy();
+    this.audioDecks.b?.destroy();
+    this.audioContext?.close();
   }
 
   setPlayer(deck, player) {
     this.players[deck] = player;
+    // Mute YouTube player - audio comes from AudioDeck
+    player.mute();
   }
 
   setTrackData(videoId, data) {
@@ -51,24 +83,33 @@ class DJEngine {
   }
 
   /**
-   * Load a track onto a deck.
+   * Load a track onto a deck (both audio and video).
    */
-  loadDeck(deck, videoId) {
+  async loadDeck(deck, videoId) {
     const player = this.players[deck];
-    if (!player) return;
-
+    const audioDeck = this.audioDecks[deck];
     const track = this.tracks[videoId];
-    player.loadVideoById({
-      videoId: videoId,
-      startSeconds: 0,
-    });
-    player.pauseVideo();
 
-    // Set playback rate to 1.0 initially
+    this._deckVideoIds[deck] = videoId;
+
+    // Load YouTube video (muted, for visuals)
+    if (player) {
+      player.loadVideoById({ videoId, startSeconds: 0 });
+      player.pauseVideo();
+      player.mute(); // Ensure muted
+    }
+
+    // Load audio from server cache
+    try {
+      await audioDeck.load(videoId);
+      this._log('info', `Deck ${deck.toUpperCase()}: loaded ${videoId} (${track?.bpm || '?'} BPM) [hybrid audio]`);
+    } catch (err) {
+      this._log('error', `Deck ${deck.toUpperCase()}: audio load failed for ${videoId}: ${err.message}`);
+    }
+
+    // Reset playback rate
     this.playbackRate[deck] = 1.0;
-    if (player.setPlaybackRate) player.setPlaybackRate(1.0);
-
-    this._log('info', `Deck ${deck.toUpperCase()}: loaded ${track?.video_id || videoId} (${track?.bpm || '?'} BPM)`);
+    audioDeck.setPlaybackRate(1.0);
 
     if (this.onUpdate) this.onUpdate('load', { deck, videoId, track });
   }
@@ -77,22 +118,36 @@ class DJEngine {
    * Start playing on a deck from a specific time.
    */
   playDeck(deck, startTime) {
+    const audioDeck = this.audioDecks[deck];
     const player = this.players[deck];
-    if (!player) return;
 
-    if (startTime !== undefined) {
-      player.seekTo(startTime, true);
+    // Resume AudioContext on first user gesture
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume();
     }
-    player.playVideo();
+
+    // Play audio (source of truth)
+    audioDeck.play(startTime);
+
+    // Sync YouTube video to same position
+    if (player) {
+      if (startTime !== undefined) {
+        player.seekTo(startTime, true);
+      }
+      player.playVideo();
+      player.mute();
+    }
+
     this._log('info', `Deck ${deck.toUpperCase()}: playing from ${this._formatTime(startTime || 0)}`);
   }
 
   pauseDeck(deck) {
+    this.audioDecks[deck]?.pause();
     this.players[deck]?.pauseVideo();
   }
 
   /**
-   * Set volume for a deck (0-100).
+   * Set volume for a deck (0-100, mapped to gain 0-1).
    */
   setDeckVolume(deck, vol) {
     this.deckVolumes[deck] = vol;
@@ -107,23 +162,63 @@ class DJEngine {
     this._applyVolumes();
   }
 
+  /**
+   * Apply volumes using Web Audio GainNodes (not YouTube setVolume).
+   * Equal-power crossfade curve for consistent perceived loudness.
+   */
   _applyVolumes() {
     const cf = this.crossfadeValue / 100;
+
     // Equal-power crossfade curve
-    const volA = Math.cos(cf * Math.PI / 2);
-    const volB = Math.sin(cf * Math.PI / 2);
+    const cfGainA = Math.cos(cf * Math.PI / 2);
+    const cfGainB = Math.sin(cf * Math.PI / 2);
 
-    const finalA = Math.round(volA * this.deckVolumes.a);
-    const finalB = Math.round(volB * this.deckVolumes.b);
+    // Combine crossfade with per-deck volume
+    const gainA = cfGainA * (this.deckVolumes.a / 100);
+    const gainB = cfGainB * (this.deckVolumes.b / 100);
 
-    if (this.players.a) this.players.a.setVolume(finalA);
-    if (this.players.b) this.players.b.setVolume(finalB);
+    // Apply via GainNode (precise, smooth, no stepping artifacts)
+    this.audioDecks.a.setGain(gainA);
+    this.audioDecks.b.setGain(gainB);
+  }
+
+  /**
+   * Sync YouTube video position to audio position.
+   * Audio is the source of truth. YouTube just shows the video.
+   */
+  _syncVideoToAudio() {
+    for (const deck of ['a', 'b']) {
+      const audioDeck = this.audioDecks[deck];
+      const player = this.players[deck];
+      if (!audioDeck || !player || !audioDeck.isPlaying()) continue;
+      if (typeof player.getCurrentTime !== 'function') continue;
+
+      const audioTime = audioDeck.getCurrentTime();
+      const videoTime = player.getCurrentTime();
+      const drift = Math.abs(audioTime - videoTime);
+
+      if (drift > this._syncThreshold) {
+        player.seekTo(audioTime, true);
+        this._log('beat', `Sync: Deck ${deck.toUpperCase()} video re-synced (drift: ${drift.toFixed(2)}s)`);
+      }
+
+      // Sync playback rate too
+      const audioRate = audioDeck.audio.playbackRate;
+      const availableRates = player.getAvailablePlaybackRates?.() || [1];
+      // YouTube only supports discrete rates - pick closest
+      const closestYTRate = availableRates.reduce((best, rate) =>
+        Math.abs(rate - audioRate) < Math.abs(best - audioRate) ? rate : best
+      );
+      if (player.getPlaybackRate?.() !== closestYTRate) {
+        player.setPlaybackRate(closestYTRate);
+      }
+    }
   }
 
   /**
    * Start automatic mixing.
    */
-  startAutoMix() {
+  async startAutoMix() {
     if (!this.mixPlan || this.queue.length < 2) {
       this._log('error', 'Need a mix plan with at least 2 tracks');
       return;
@@ -136,10 +231,10 @@ class DJEngine {
     const firstId = this.queue[0];
     const secondId = this.queue[1];
 
-    this.loadDeck('a', firstId);
-    this.loadDeck('b', secondId);
+    await this.loadDeck('a', firstId);
+    await this.loadDeck('b', secondId);
 
-    // Start playing deck A from the beginning (or mix-in point)
+    // Start playing deck A from mix-in point
     const firstTrack = this.tracks[firstId];
     const startTime = firstTrack?.transitions?.mix_in || 0;
 
@@ -147,12 +242,12 @@ class DJEngine {
     this.crossfadeValue = 0;
     this._applyVolumes();
 
-    // Small delay to let YouTube buffer
+    // Small delay for buffering
     setTimeout(() => {
       this.playDeck('a', startTime);
-      this._log('info', `Auto-mix started with ${this.queue.length} tracks`);
+      this._log('info', `Auto-mix started with ${this.queue.length} tracks [hybrid audio mode]`);
       this._scheduleNextTransition();
-    }, 1000);
+    }, 500);
 
     if (this.onUpdate) this.onUpdate('automix-start', { queue: this.queue });
   }
@@ -181,6 +276,7 @@ class DJEngine {
 
   /**
    * Schedule the next transition based on the mix plan.
+   * Uses audio position (not YouTube) for timing.
    */
   _scheduleNextTransition() {
     if (!this.autoMixing || this._transitionScheduled) return;
@@ -193,23 +289,21 @@ class DJEngine {
 
     const transition = this.mixPlan.transitions[transIdx];
     const currentDeck = this.activeDeck;
-    const player = this.players[currentDeck];
-    if (!player) return;
+    const audioDeck = this.audioDecks[currentDeck];
+    if (!audioDeck) return;
 
     this._transitionScheduled = true;
 
-    // Calculate when to start the transition
     const checkInterval = setInterval(() => {
       if (!this.autoMixing) {
         clearInterval(checkInterval);
         return;
       }
 
-      const currentTime = player.getCurrentTime?.() || 0;
+      const currentTime = audioDeck.getCurrentTime();
       const outPoint = transition.fromOutPoint;
       const leadTime = transition.crossfadeDuration || 8;
 
-      // Start transition when we're <leadTime> seconds before the out point
       if (currentTime >= outPoint - leadTime) {
         clearInterval(checkInterval);
         this._executeTransition();
@@ -235,23 +329,18 @@ class DJEngine {
     this._log('info', `  BPM: ${transition.fromBpm} -> ${transition.toBpm} (diff: ${transition.bpmDiff.toFixed(1)})`);
     this._log('info', `  Technique: ${transition.technique}`);
 
-    // Prepare the incoming deck
-    const toTrack = this.tracks[transition.to];
-    const inPoint = transition.toInPoint || 0;
-
-    // Sync playback rates for beat matching
+    // Match BPMs using precise arbitrary playback rate
     if (transition.type !== 'cut' && transition.bpmDiff > 0.5) {
       this._matchBPMs(fromDeck, toDeck, transition);
     }
 
     // Start the incoming track at its in-point
+    const inPoint = transition.toInPoint || 0;
     this.playDeck(toDeck, inPoint);
 
     if (transition.type === 'cut') {
-      // Hard cut: instant switch
       this._hardCut(fromDeck, toDeck);
     } else {
-      // Crossfade
       this._crossfadeTransition(fromDeck, toDeck, transition);
     }
 
@@ -259,16 +348,14 @@ class DJEngine {
   }
 
   /**
-   * Match BPMs between decks using playback rate adjustment.
-   * YouTube IFrame API only supports discrete rates: 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2
+   * Match BPMs using precise arbitrary playback rate.
+   * No longer constrained to YouTube's discrete rates!
    */
   _matchBPMs(fromDeck, toDeck, transition) {
-    const YOUTUBE_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
-
     const fromBpm = transition.fromBpm;
     const toBpm = transition.toBpm;
 
-    // Check if it's a double/half time relationship
+    // Handle double/half time relationships
     let targetBpm = fromBpm;
     let ratio = fromBpm / toBpm;
 
@@ -278,26 +365,15 @@ class DJEngine {
       targetBpm = fromBpm * 2;
     }
 
-    const idealRate = targetBpm / toBpm;
+    const rate = targetBpm / toBpm;
 
-    // Snap to nearest YouTube-supported rate
-    const snappedRate = YOUTUBE_RATES.reduce((best, rate) =>
-      Math.abs(rate - idealRate) < Math.abs(best - idealRate) ? rate : best
-    );
+    // Clamp to reasonable range to avoid pitch artifacts
+    const clampedRate = Math.max(0.5, Math.min(2.0, rate));
 
-    // Only apply if the snapped rate actually helps (within 4% of target)
-    const effectiveBpm = toBpm * snappedRate;
-    const bpmError = Math.abs(effectiveBpm - targetBpm) / targetBpm;
-
-    if (snappedRate !== 1 && bpmError < 0.04) {
-      this.playbackRate[toDeck] = snappedRate;
-      const player = this.players[toDeck];
-      if (player?.setPlaybackRate) {
-        player.setPlaybackRate(snappedRate);
-        this._log('beat', `BPM match: ${toDeck.toUpperCase()} rate=${snappedRate} (${toBpm} -> ${effectiveBpm.toFixed(1)} BPM, target=${targetBpm.toFixed(1)}, err=${(bpmError*100).toFixed(1)}%)`);
-      }
-    } else if (snappedRate !== 1) {
-      this._log('warn', `BPM match skipped: best rate ${snappedRate} gives ${(bpmError*100).toFixed(1)}% error (${toBpm} -> ${effectiveBpm.toFixed(1)} vs target ${targetBpm.toFixed(1)})`);
+    if (Math.abs(clampedRate - 1.0) > 0.001) {
+      this.playbackRate[toDeck] = clampedRate;
+      this.audioDecks[toDeck].setPlaybackRate(clampedRate);
+      this._log('beat', `BPM match: ${toDeck.toUpperCase()} rate=${clampedRate.toFixed(4)} (${toBpm} -> ${(toBpm * clampedRate).toFixed(1)} BPM, target=${targetBpm.toFixed(1)})`);
     }
   }
 
@@ -305,10 +381,9 @@ class DJEngine {
    * Hard cut transition: instant switch on the nearest downbeat.
    */
   _hardCut(fromDeck, toDeck) {
-    // Wait for the next downbeat on the outgoing track
-    const fromTrack = this.tracks[this.queue[this.queueIndex]];
-    const player = this.players[fromDeck];
-    const currentTime = player?.getCurrentTime?.() || 0;
+    const fromTrack = this.tracks[this._deckVideoIds[fromDeck]];
+    const audioDeck = this.audioDecks[fromDeck];
+    const currentTime = audioDeck.getCurrentTime();
 
     // Find next downbeat (every 4 beats)
     let cutTime = currentTime;
@@ -324,7 +399,7 @@ class DJEngine {
     const delay = Math.max(0, (cutTime - currentTime) * 1000);
 
     setTimeout(() => {
-      // Instant crossfade
+      // Instant crossfade via GainNode
       if (this.activeDeck === 'a') {
         this.crossfadeValue = 100;
       } else {
@@ -332,28 +407,26 @@ class DJEngine {
       }
       this._applyVolumes();
       this.pauseDeck(fromDeck);
-
       this._finishTransition(toDeck);
     }, delay);
 
-    this._log('beat', `Hard cut scheduled in ${(delay/1000).toFixed(2)}s`);
+    this._log('beat', `Hard cut scheduled in ${(delay / 1000).toFixed(2)}s`);
   }
 
   /**
-   * Crossfade transition: smooth blend between decks over several beats.
+   * Crossfade transition using Web Audio GainNodes.
+   * S-curve smoothing for natural-sounding blend.
    */
   _crossfadeTransition(fromDeck, toDeck, transition) {
     const duration = transition.crossfadeDuration * 1000; // ms
-    const steps = 60; // Number of crossfade steps
+    const steps = 60;
     const stepDuration = duration / steps;
 
     const startCf = this.crossfadeValue;
     const endCf = toDeck === 'b' ? 100 : 0;
-    const cfDelta = (endCf - startCf) / steps;
 
     let step = 0;
 
-    // Apply EQ-style crossfade: bring in lows first, then full mix
     const fadeInterval = setInterval(() => {
       if (!this.autoMixing || step >= steps) {
         clearInterval(fadeInterval);
@@ -364,9 +437,9 @@ class DJEngine {
         return;
       }
 
-      // S-curve crossfade for smoother blending
+      // S-curve (smoothstep) for natural crossfade
       const t = step / steps;
-      const sCurve = t * t * (3 - 2 * t); // Smoothstep
+      const sCurve = t * t * (3 - 2 * t);
       this.crossfadeValue = startCf + (endCf - startCf) * sCurve;
       this._applyVolumes();
 
@@ -386,7 +459,7 @@ class DJEngine {
   /**
    * Complete a transition and prepare for the next one.
    */
-  _finishTransition(newActiveDeck) {
+  async _finishTransition(newActiveDeck) {
     this.activeDeck = newActiveDeck;
     this.transitioning = false;
     this.queueIndex++;
@@ -396,12 +469,13 @@ class DJEngine {
     // Reset playback rate on the old deck
     const oldDeck = newActiveDeck === 'a' ? 'b' : 'a';
     this.playbackRate[oldDeck] = 1.0;
+    this.audioDecks[oldDeck].setPlaybackRate(1.0);
 
     // Pre-load next track on the now-free deck
     const nextIdx = this.queueIndex + 1;
     if (nextIdx < this.queue.length) {
       const nextId = this.queue[nextIdx];
-      this.loadDeck(oldDeck, nextId);
+      await this.loadDeck(oldDeck, nextId);
       this._log('info', `Pre-loaded next track on Deck ${oldDeck.toUpperCase()}: ${nextId}`);
     }
 
@@ -420,22 +494,18 @@ class DJEngine {
 
   /**
    * Main update tick - runs every 50ms.
-   * Tracks beat positions and manages timing.
+   * Uses audio position for beat tracking (more accurate than YouTube).
    */
   _tick() {
     for (const deck of ['a', 'b']) {
-      const player = this.players[deck];
-      if (!player || typeof player.getCurrentTime !== 'function') continue;
+      const audioDeck = this.audioDecks[deck];
+      if (!audioDeck?.isPlaying()) continue;
 
-      const state = player.getPlayerState?.();
-      if (state !== 1) continue; // 1 = playing
-
-      const time = player.getCurrentTime();
-      const videoId = this._getCurrentVideoId(deck);
+      const time = audioDeck.getCurrentTime();
+      const videoId = this._deckVideoIds[deck];
       const track = this.tracks[videoId];
 
       if (track) {
-        // Check beat position
         this._checkBeat(deck, time, track);
       }
     }
@@ -444,28 +514,18 @@ class DJEngine {
   _checkBeat(deck, time, track) {
     if (!track.beat_grid || track.beat_grid.length === 0) return;
 
-    // Find nearest beat
     const interval = track.beat_interval;
     const offset = track.beat_grid[0] || 0;
     const beatPos = ((time - offset) / interval);
     const nearestBeat = Math.round(beatPos);
     const distToBeat = Math.abs(beatPos - nearestBeat) * interval;
 
-    // If we're very close to a beat (within 30ms), fire beat event
+    // Fire beat event within 30ms of beat position
     if (distToBeat < 0.03) {
       const isDownbeat = nearestBeat % 4 === 0;
       if (this.onUpdate) {
         this.onUpdate('beat', { deck, time, isDownbeat, beatNum: nearestBeat });
       }
-    }
-  }
-
-  _getCurrentVideoId(deck) {
-    if (deck === 'a') {
-      return this.queue[this.queueIndex] || null;
-    } else {
-      const idx = this.queueIndex + 1;
-      return idx < this.queue.length ? this.queue[idx] : null;
     }
   }
 
@@ -497,17 +557,20 @@ class DJEngine {
       queueIndex: this.queueIndex,
       queueLength: this.queue.length,
       playbackRates: { ...this.playbackRate },
+      hybridMode: true,
       decks: {}
     };
 
     for (const deck of ['a', 'b']) {
-      const player = this.players[deck];
-      if (player && typeof player.getCurrentTime === 'function') {
+      const audioDeck = this.audioDecks[deck];
+      if (audioDeck) {
         state.decks[deck] = {
-          time: player.getCurrentTime(),
-          duration: player.getDuration?.() || 0,
-          state: player.getPlayerState?.() || -1,
-          volume: player.getVolume?.() || 0,
+          time: audioDeck.getCurrentTime(),
+          duration: audioDeck.getDuration(),
+          playing: audioDeck.isPlaying(),
+          gain: audioDeck.gainNode.gain.value,
+          rmsLevel: audioDeck.isPlaying() ? audioDeck.getRMSLevel() : 0,
+          playbackRate: audioDeck.audio.playbackRate,
         };
       }
     }
@@ -516,5 +579,4 @@ class DJEngine {
   }
 }
 
-// Export for use in app.js
 window.DJEngine = DJEngine;
