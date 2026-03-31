@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 import librosa
 
 
-def download_audio(video_id, output_dir):
+def download_audio(video_id, output_dir, yt_dlp_binary='yt-dlp'):
     """Download audio from YouTube video using yt-dlp."""
     output_path = os.path.join(output_dir, f"{video_id}.wav")
     if os.path.exists(output_path):
@@ -26,7 +26,7 @@ def download_audio(video_id, output_dir):
 
     temp_path = os.path.join(output_dir, f"{video_id}_temp")
     cmd = [
-        "yt-dlp",
+        yt_dlp_binary,
         "-x",
         "--audio-format", "wav",
         "--audio-quality", "0",
@@ -345,12 +345,12 @@ def estimate_genre_energy(y, sr):
     }
 
 
-def analyze_track(video_id, audio_dir):
+def analyze_track(video_id, audio_dir, yt_dlp_binary='yt-dlp'):
     """Full analysis of a single track. Returns result dict (never throws)."""
     print(f"Analyzing {video_id}...", file=sys.stderr)
 
     try:
-        audio_path = download_audio(video_id, audio_dir)
+        audio_path = download_audio(video_id, audio_dir, yt_dlp_binary)
         if not audio_path:
             return {'error': f'Failed to download audio for {video_id}', 'video_id': video_id}
 
@@ -412,11 +412,11 @@ def analyze_track(video_id, audio_dir):
         return {'error': str(e), 'video_id': video_id}
 
 
-def analyze_playlist(video_ids, audio_dir):
+def analyze_playlist(video_ids, audio_dir, yt_dlp_binary='yt-dlp'):
     """Analyze all tracks in a playlist."""
     results = []
     for vid in video_ids:
-        result = analyze_track(vid, audio_dir)
+        result = analyze_track(vid, audio_dir, yt_dlp_binary)
         results.append(result)
         # Print progress
         print(json.dumps({"progress": len(results), "total": len(video_ids), "current": vid}),
@@ -427,12 +427,14 @@ def analyze_playlist(video_ids, audio_dir):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: analyze.py <video_id1,video_id2,...> [audio_dir]", file=sys.stderr)
+        print("Usage: analyze.py <video_id1,video_id2,...> [audio_dir] [yt_dlp_path]", file=sys.stderr)
         sys.exit(1)
 
     video_ids = sys.argv[1].split(',')
     audio_dir = sys.argv[2] if len(sys.argv) > 2 else './audio_cache'
+    # Accept yt-dlp binary path from the Node server
+    yt_dlp_binary = sys.argv[3] if len(sys.argv) > 3 else 'yt-dlp'
     os.makedirs(audio_dir, exist_ok=True)
 
-    results = analyze_playlist(video_ids, audio_dir)
+    results = analyze_playlist(video_ids, audio_dir, yt_dlp_binary)
     print(json.dumps(results, indent=2))

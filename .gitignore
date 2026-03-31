@@ -1,4 +1,5 @@
 node_modules/
+bin/
 audio_cache/
 analysis_cache/
 __pycache__/

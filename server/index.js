@@ -1,8 +1,9 @@
 const express = require('express');
-const { spawn, spawnSync, execSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const YTDlpWrap = require('yt-dlp-wrap-plus').default || require('yt-dlp-wrap-plus');
 const { generateAllDemoData } = require('./demo-generator');
 
 const app = express();
@@ -12,17 +13,78 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const AUDIO_DIR = path.join(__dirname, '..', 'audio_cache');
 const ANALYSIS_DIR = path.join(__dirname, '..', 'analysis_cache');
+const BIN_DIR = path.join(__dirname, '..', 'bin');
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 fs.mkdirSync(ANALYSIS_DIR, { recursive: true });
+fs.mkdirSync(BIN_DIR, { recursive: true });
+
+// yt-dlp binary path (managed by yt-dlp-wrap-plus)
+const YT_DLP_PATH = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+let ytdlp = null;  // YTDlpWrap instance, set after ensureYtDlp()
+
+/**
+ * Ensure yt-dlp binary is available. Downloads if missing.
+ */
+async function ensureYtDlp() {
+  // Check if system yt-dlp exists first
+  const systemCheck = spawnSync('yt-dlp', ['--version'], { timeout: 5000 });
+  if (systemCheck.status === 0) {
+    const version = systemCheck.stdout.toString().trim();
+    console.log(`Using system yt-dlp: ${version}`);
+    ytdlp = new YTDlpWrap('yt-dlp');
+    return 'yt-dlp';
+  }
+
+  // Check if we already downloaded it
+  if (fs.existsSync(YT_DLP_PATH)) {
+    const check = spawnSync(YT_DLP_PATH, ['--version'], { timeout: 5000 });
+    if (check.status === 0) {
+      const version = check.stdout.toString().trim();
+      console.log(`Using local yt-dlp: ${version} (${YT_DLP_PATH})`);
+      ytdlp = new YTDlpWrap(YT_DLP_PATH);
+      return YT_DLP_PATH;
+    }
+  }
+
+  // Download yt-dlp binary from GitHub
+  console.log('yt-dlp not found. Downloading from GitHub...');
+  try {
+    await YTDlpWrap.downloadFromGithub(YT_DLP_PATH);
+    // Make executable on Unix
+    if (process.platform !== 'win32') {
+      fs.chmodSync(YT_DLP_PATH, 0o755);
+    }
+    const check = spawnSync(YT_DLP_PATH, ['--version'], { timeout: 5000 });
+    const version = check.stdout?.toString().trim() || 'unknown';
+    console.log(`Downloaded yt-dlp ${version} to ${YT_DLP_PATH}`);
+    ytdlp = new YTDlpWrap(YT_DLP_PATH);
+    return YT_DLP_PATH;
+  } catch (err) {
+    console.error('Failed to download yt-dlp:', err.message);
+    throw new Error('yt-dlp is not installed and auto-download failed. Install manually: pip install yt-dlp');
+  }
+}
+
+/**
+ * Get the path to the yt-dlp binary (for passing to Python).
+ */
+function getYtDlpBinaryPath() {
+  return ytdlp?.getBinaryPath() || 'yt-dlp';
+}
 
 // Extract video IDs from a YouTube playlist URL
 app.post('/api/playlist', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
 
+  if (!ytdlp) {
+    return res.status(503).json({ error: 'yt-dlp is still initializing. Try again in a moment.' });
+  }
+
   try {
-    // Use spawnSync with args array to avoid shell interpretation of URL characters (?, &, etc.)
-    const result = spawnSync('yt-dlp', [
+    // Use the managed yt-dlp binary via spawnSync with args array
+    const binaryPath = getYtDlpBinaryPath();
+    const result = spawnSync(binaryPath, [
       '--flat-playlist', '-J',
       '--no-check-certificates',
       '--no-warnings',
@@ -58,7 +120,9 @@ app.post('/api/playlist', async (req, res) => {
     console.error('Playlist extraction error:', errStr);
 
     let errorMsg;
-    if (errStr.includes('proxy') || errStr.includes('Forbidden') || errStr.includes('Tunnel connection failed')) {
+    if (errStr.includes('ENOENT')) {
+      errorMsg = 'yt-dlp binary not found. Server is downloading it — restart and try again.';
+    } else if (errStr.includes('proxy') || errStr.includes('Forbidden') || errStr.includes('Tunnel connection failed')) {
       errorMsg = 'Cannot reach YouTube (network/proxy blocked). Try the Offline Demo instead.';
     } else if (errStr.includes('not a valid URL') || errStr.includes('Unsupported URL')) {
       errorMsg = 'Invalid URL. Paste a YouTube playlist URL (e.g. https://www.youtube.com/playlist?list=...).';
@@ -75,6 +139,10 @@ app.post('/api/playlist', async (req, res) => {
 app.post('/api/analyze', (req, res) => {
   const { videoIds } = req.body;
   if (!videoIds || !videoIds.length) return res.status(400).json({ error: 'videoIds required' });
+
+  if (!ytdlp) {
+    return res.status(503).json({ error: 'yt-dlp is still initializing. Try again in a moment.' });
+  }
 
   // Check cache first
   const cached = [];
@@ -96,12 +164,14 @@ app.post('/api/analyze', (req, res) => {
 
   console.log(`Analyzing ${toAnalyze.length} tracks (${cached.length} cached)...`);
 
-  // Run Python analysis with generous timeout (3 min per track)
+  // Pass the yt-dlp binary path to Python so it uses the same binary
+  const binaryPath = getYtDlpBinaryPath();
   const timeoutMs = toAnalyze.length * 3 * 60 * 1000;
   const py = spawn('python3', [
     path.join(__dirname, 'analyze.py'),
     toAnalyze.join(','),
-    AUDIO_DIR
+    AUDIO_DIR,
+    binaryPath  // Third arg: yt-dlp binary path
   ], { timeout: timeoutMs });
 
   let stdout = '';
@@ -138,7 +208,6 @@ app.post('/api/analyze', (req, res) => {
       } catch (_) {}
 
       if (partialResults.length > 0) {
-        // Cache whatever succeeded
         for (const track of partialResults) {
           if (!track.error) {
             const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
@@ -155,8 +224,10 @@ app.post('/api/analyze', (req, res) => {
         errorMsg = 'Cannot download audio from YouTube (network/proxy blocked). Try the Offline Demo instead.';
       } else if (stderr.includes('ModuleNotFoundError') || stderr.includes('ImportError')) {
         errorMsg = 'Missing Python dependency. Run: pip install librosa numpy';
-      } else if (stderr.includes('yt-dlp') || stderr.includes('Unable to download')) {
-        errorMsg = 'yt-dlp failed to download audio. Try updating: pip install -U yt-dlp';
+      } else if (stderr.includes('No such file') || stderr.includes('ENOENT')) {
+        errorMsg = 'yt-dlp binary not found. Restart the server to trigger auto-download.';
+      } else if (stderr.includes('Unable to download')) {
+        errorMsg = 'yt-dlp failed to download audio. Check your internet connection.';
       } else if (stderr.includes('ffmpeg')) {
         errorMsg = 'ffmpeg is required for audio conversion. Install ffmpeg and try again.';
       }
@@ -168,7 +239,6 @@ app.post('/api/analyze', (req, res) => {
       const succeeded = results.filter(t => !t.error);
       const failed = results.filter(t => t.error);
 
-      // Cache successful results
       for (const track of succeeded) {
         const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
         fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
@@ -193,7 +263,6 @@ app.post('/api/demo', (req, res) => {
     console.log('Generating demo data...');
     const playlist = generateAllDemoData(AUDIO_DIR, ANALYSIS_DIR);
 
-    // Load analysis data for all demo tracks
     const tracks = [];
     for (const track of playlist) {
       const analysisPath = path.join(ANALYSIS_DIR, `${track.id}.json`);
@@ -202,9 +271,7 @@ app.post('/api/demo', (req, res) => {
       }
     }
 
-    // Generate mix plan
     const plan = generateMixPlan(tracks);
-
     res.json({ playlist, tracks, plan });
     console.log(`Demo data ready: ${playlist.length} synthetic tracks`);
   } catch (err) {
@@ -226,7 +293,6 @@ app.get('/api/audio/:videoId', (req, res) => {
   const range = req.headers.range;
 
   if (range) {
-    // Support range requests for seeking
     const parts = range.replace(/bytes=/, '').split('-');
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
@@ -271,10 +337,8 @@ app.post('/api/mixplan', (req, res) => {
 });
 
 function generateMixPlan(tracks) {
-  // Sort tracks for optimal mixing order considering BPM progression and key compatibility
   const ordered = orderTracksForMix(tracks);
 
-  // Generate transitions between consecutive tracks
   const transitions = [];
   for (let i = 0; i < ordered.length - 1; i++) {
     const from = ordered[i];
@@ -288,7 +352,6 @@ function generateMixPlan(tracks) {
 function orderTracksForMix(tracks) {
   if (tracks.length <= 2) return tracks;
 
-  // Greedy nearest-neighbor ordering based on BPM + key compatibility
   const remaining = [...tracks];
   const ordered = [remaining.shift()];
 
@@ -301,7 +364,6 @@ function orderTracksForMix(tracks) {
       const candidate = remaining[i];
       const bpmDiff = Math.abs(last.bpm - candidate.bpm);
       const keyCompat = keyCompatibility(last.key?.camelot, candidate.key?.camelot);
-      // Score: lower is better. BPM matters most, key is a bonus.
       const score = bpmDiff * 2 + (1 - keyCompat) * 10;
       if (score < bestScore) {
         bestScore = score;
@@ -325,7 +387,7 @@ function keyCompatibility(camelot1, camelot2) {
 
   if (camelot1 === camelot2) return 1.0;
   if (letter1 === letter2 && (Math.abs(num1 - num2) === 1 || Math.abs(num1 - num2) === 11)) return 0.9;
-  if (num1 === num2 && letter1 !== letter2) return 0.85; // Relative major/minor
+  if (num1 === num2 && letter1 !== letter2) return 0.85;
   if (Math.abs(num1 - num2) <= 2 || Math.abs(num1 - num2) >= 10) return 0.6;
   return 0.3;
 }
@@ -334,61 +396,46 @@ function planTransition(from, to) {
   const bpmDiff = Math.abs(from.bpm - to.bpm);
   const bpmRatio = from.bpm / to.bpm;
 
-  // With Web Audio API, we can use arbitrary playback rates (not limited to YouTube's discrete set).
-  // Calculate the exact rate needed for perfect BPM matching.
   const exactRate = from.bpm / to.bpm;
-  // Clamp to reasonable range where pitch artifacts aren't too noticeable
   const clampedRate = Math.max(0.5, Math.min(2.0, exactRate));
   const effectiveBpm = to.bpm * clampedRate;
   const rateError = Math.abs(effectiveBpm - from.bpm) / from.bpm;
-  const canTempoMatch = rateError < 0.001; // Essentially perfect with arbitrary rates
+  const canTempoMatch = rateError < 0.001;
 
-  // Determine transition type
   let type, duration, technique;
 
   if (bpmDiff < 3) {
-    // Very close BPMs - long smooth blend
     type = 'smooth';
-    duration = 16; // 16 beats
+    duration = 16;
     technique = 'crossfade with beat sync';
   } else if (bpmDiff < 12 && canTempoMatch) {
-    // Moderate difference - precise tempo match via Web Audio playbackRate
     type = 'blend';
     duration = 12;
     technique = `beat-matched crossfade (rate=${clampedRate.toFixed(4)})`;
   } else if ((bpmRatio > 1.9 && bpmRatio < 2.1) || (bpmRatio > 0.48 && bpmRatio < 0.52)) {
-    // Double/half time relationship
     type = 'double-time';
     duration = 8;
     technique = 'half-time blend';
   } else if (bpmDiff < 20) {
-    // Larger difference but still blendable with rate adjustment
     type = 'blend';
     duration = 6;
     technique = `tempo-shifted crossfade (rate=${clampedRate.toFixed(4)})`;
   } else {
-    // Very large difference - hard cut on a downbeat
     type = 'cut';
     duration = 1;
     technique = 'hard cut on downbeat';
   }
 
-  // Find best transition point
   const outPoint = from.transitions?.mix_out || from.duration * 0.85;
   const inPoint = to.transitions?.mix_in || 0;
-
-  // Calculate beat-aligned start/end
   const fromBeatInterval = 60 / from.bpm;
-  const toBeatInterval = 60 / to.bpm;
   const transitionBeats = duration;
 
-  // Snap outPoint to nearest beat grid position
   let snapOut = outPoint;
   if (from.beat_grid && from.beat_grid.length > 0) {
     const nearest = from.beat_grid.reduce((a, b) =>
       Math.abs(b - outPoint) < Math.abs(a - outPoint) ? b : a
     );
-    // Snap to a downbeat (every 4 beats)
     const beatIdx = from.beat_grid.indexOf(nearest);
     const downbeatIdx = Math.round(beatIdx / 4) * 4;
     snapOut = from.beat_grid[Math.min(downbeatIdx, from.beat_grid.length - 1)];
@@ -420,7 +467,22 @@ function planTransition(from, to) {
   };
 }
 
+// ---- Server startup ----
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`YouTube DJ server running on http://localhost:${PORT}`);
-});
+
+async function start() {
+  try {
+    const binaryPath = await ensureYtDlp();
+    console.log(`yt-dlp ready: ${binaryPath}`);
+  } catch (err) {
+    console.warn(`WARNING: ${err.message}`);
+    console.warn('YouTube playlist loading and analysis will not work.');
+    console.warn('The Offline Demo will still work.');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`YouTube DJ server running on http://localhost:${PORT}`);
+  });
+}
+
+start();
