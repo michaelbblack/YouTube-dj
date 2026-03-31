@@ -239,6 +239,8 @@ button:disabled { background: #444; cursor: not-allowed; }
 #automix-btn:hover { background: #2ea043; }
 #automix-btn.active { background: #f0883e; }
 
+#offline-btn { background: #30363d; font-size: 12px; }
+
 #stop-btn { background: #6e40c9; }
 
 #transition-info {

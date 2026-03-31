@@ -309,9 +309,23 @@ async function loadPlaylist() {
   }
 }
 
-async function loadDemo() {
-  setStatus('Generating demo tracks (synthetic audio)...');
-  document.getElementById('demo-btn').disabled = true;
+function loadDemo() {
+  // Real YouTube videos for testing with actual content
+  playlist = [
+    { id: 'dQw4w9WgXcQ', title: 'Rick Astley - Never Gonna Give You Up', duration: 213 },
+    { id: 'fJ9rUzIMcZQ', title: 'Queen - Bohemian Rhapsody', duration: 354 },
+    { id: 'kJQP7kiw5Fk', title: 'Luis Fonsi - Despacito', duration: 282 },
+    { id: 'JGwWNGJdvx8', title: 'Ed Sheeran - Shape of You', duration: 263 },
+    { id: '09R8_2nJtjg', title: 'Maroon 5 - Sugar', duration: 235 },
+  ];
+  analysisData = {};
+  setStatus('Demo playlist loaded (5 YouTube tracks). Click "Analyze All" to download & analyze.');
+  renderTrackList();
+}
+
+async function loadOfflineDemo() {
+  setStatus('Generating synthetic demo tracks...');
+  document.getElementById('offline-btn').disabled = true;
 
   try {
     const res = await fetch('/api/demo', {
@@ -326,35 +340,30 @@ async function loadDemo() {
 
     const data = await res.json();
 
-    // Set playlist
     playlist = data.playlist;
     renderTrackList();
 
-    // Store analysis results
     for (const track of data.tracks) {
       analysisData[track.video_id] = track;
       engine.setTrackData(track.video_id, track);
     }
 
-    // Set mix plan
     if (data.plan) {
       engine.setMixPlan(data.plan);
 
-      // Reorder playlist to match plan
       const orderedPlaylist = data.plan.order.map(id =>
         playlist.find(t => t.id === id) || { id, title: id }
       );
       playlist = orderedPlaylist;
       renderTrackList();
-
       debug.renderTransitions(data.plan, analysisData);
     }
 
-    setStatus(`Demo ready! ${data.tracks.length} synthetic tracks analyzed and ordered. Hit AUTO MIX!`);
+    setStatus(`Offline demo ready! ${data.tracks.length} synthetic tracks. Hit AUTO MIX!`);
   } catch (err) {
     setStatus(`Error: ${err.message}`);
   } finally {
-    document.getElementById('demo-btn').disabled = false;
+    document.getElementById('offline-btn').disabled = false;
   }
 }
 

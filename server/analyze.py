@@ -30,29 +30,78 @@ def download_audio(video_id, output_dir):
         "-x",
         "--audio-format", "wav",
         "--audio-quality", "0",
-        "-o", f"{temp_path}.%(ext)s",
+        "--no-check-certificates",
         "--no-playlist",
+        "--retries", "3",
+        "--socket-timeout", "30",
+        "-o", f"{temp_path}.%(ext)s",
         f"https://www.youtube.com/watch?v={video_id}"
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
-        # yt-dlp may produce temp file with different name
-        for ext in ['wav', 'webm', 'opus', 'm4a', 'mp3']:
+        print(f"Downloading audio for {video_id}...", file=sys.stderr)
+        result = subprocess.run(cmd, capture_output=True, timeout=180, text=True)
+        if result.returncode != 0:
+            err = result.stderr.strip()
+            print(f"yt-dlp error for {video_id}: {err}", file=sys.stderr)
+            # Clean up any partial temp files
+            _cleanup_temp_files(temp_path)
+            return None
+
+        # yt-dlp may produce temp file with different name/extension
+        found = False
+        for ext in ['wav', 'webm', 'opus', 'm4a', 'mp3', 'ogg', 'aac']:
             candidate = f"{temp_path}.{ext}"
             if os.path.exists(candidate):
                 if ext != 'wav':
-                    subprocess.run([
+                    print(f"Converting {ext} -> wav for {video_id}...", file=sys.stderr)
+                    ffmpeg_result = subprocess.run([
                         'ffmpeg', '-i', candidate, '-ar', '44100', '-ac', '1',
                         output_path, '-y'
-                    ], check=True, capture_output=True, timeout=60)
+                    ], capture_output=True, timeout=120, text=True)
                     os.remove(candidate)
+                    if ffmpeg_result.returncode != 0:
+                        print(f"ffmpeg error for {video_id}: {ffmpeg_result.stderr}", file=sys.stderr)
+                        return None
                 else:
                     os.rename(candidate, output_path)
+                found = True
                 break
+
+        if not found:
+            # yt-dlp may have used a different naming pattern; search for any matching file
+            import glob
+            matches = glob.glob(f"{temp_path}*")
+            if matches:
+                src = matches[0]
+                print(f"Found unexpected file {src}, converting for {video_id}...", file=sys.stderr)
+                subprocess.run([
+                    'ffmpeg', '-i', src, '-ar', '44100', '-ac', '1',
+                    output_path, '-y'
+                ], capture_output=True, timeout=120)
+                os.remove(src)
+            else:
+                print(f"No audio file found after download for {video_id}", file=sys.stderr)
+                return None
+
         return output_path if os.path.exists(output_path) else None
+    except subprocess.TimeoutExpired:
+        print(f"Timeout downloading {video_id} (>180s)", file=sys.stderr)
+        _cleanup_temp_files(temp_path)
+        return None
     except Exception as e:
         print(f"Error downloading {video_id}: {e}", file=sys.stderr)
+        _cleanup_temp_files(temp_path)
         return None
+
+
+def _cleanup_temp_files(temp_path):
+    """Remove any leftover temp files from a failed download."""
+    import glob
+    for f in glob.glob(f"{temp_path}*"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 
 def analyze_bpm_and_beats(y, sr):
@@ -297,57 +346,70 @@ def estimate_genre_energy(y, sr):
 
 
 def analyze_track(video_id, audio_dir):
-    """Full analysis of a single track."""
+    """Full analysis of a single track. Returns result dict (never throws)."""
     print(f"Analyzing {video_id}...", file=sys.stderr)
 
-    audio_path = download_audio(video_id, audio_dir)
-    if not audio_path:
-        return {'error': f'Failed to download {video_id}', 'video_id': video_id}
+    try:
+        audio_path = download_audio(video_id, audio_dir)
+        if not audio_path:
+            return {'error': f'Failed to download audio for {video_id}', 'video_id': video_id}
 
-    # Load audio
-    y, sr = librosa.load(audio_path, sr=44100, mono=True)
-    duration = float(librosa.get_duration(y=y, sr=sr))
+        # Load audio
+        print(f"Loading audio for {video_id}...", file=sys.stderr)
+        y, sr = librosa.load(audio_path, sr=44100, mono=True)
+        duration = float(librosa.get_duration(y=y, sr=sr))
 
-    # Run all analyses
-    bpm, beats, bpm_debug = analyze_bpm_and_beats(y, sr)
-    key_info = analyze_key(y, sr)
-    energy_sections = analyze_energy_profile(y, sr)
-    transitions = find_transition_points(beats, energy_sections, duration)
-    genre_energy = estimate_genre_energy(y, sr)
+        if duration < 5:
+            return {'error': f'Audio too short ({duration:.1f}s) for {video_id}', 'video_id': video_id}
 
-    # Compute beat grid (evenly spaced beats based on BPM, anchored to detected beats)
-    beat_interval = 60.0 / bpm
-    if beats:
-        # Anchor to median beat offset
-        offsets = [(b % beat_interval) for b in beats[:16]]
-        anchor = float(np.median(offsets))
-        beat_grid = []
-        t = anchor
-        while t < duration:
-            beat_grid.append(round(t, 4))
-            t += beat_interval
-    else:
-        beat_grid = [round(i * beat_interval, 4) for i in range(int(duration / beat_interval))]
+        # Run all analyses
+        print(f"Detecting BPM for {video_id}...", file=sys.stderr)
+        bpm, beats, bpm_debug = analyze_bpm_and_beats(y, sr)
 
-    result = {
-        'video_id': video_id,
-        'duration': duration,
-        'bpm': round(bpm, 2),
-        'beats': [round(b, 4) for b in beats],
-        'beat_grid': beat_grid,
-        'beat_interval': round(beat_interval, 4),
-        'key': key_info,
-        'energy_sections': energy_sections,
-        'transitions': transitions,
-        'genre': genre_energy,
-        'debug': {
-            'bpm_strategies': bpm_debug['strategies'],
-            'chosen_strategy': bpm_debug['chosen_strategy'],
-            'audio_path': audio_path
+        print(f"Detecting key for {video_id}...", file=sys.stderr)
+        key_info = analyze_key(y, sr)
+
+        print(f"Computing energy profile for {video_id}...", file=sys.stderr)
+        energy_sections = analyze_energy_profile(y, sr)
+        transitions = find_transition_points(beats, energy_sections, duration)
+        genre_energy = estimate_genre_energy(y, sr)
+
+        # Compute beat grid (evenly spaced beats based on BPM, anchored to detected beats)
+        beat_interval = 60.0 / bpm
+        if beats:
+            # Anchor to median beat offset
+            offsets = [(b % beat_interval) for b in beats[:16]]
+            anchor = float(np.median(offsets))
+            beat_grid = []
+            t = anchor
+            while t < duration:
+                beat_grid.append(round(t, 4))
+                t += beat_interval
+        else:
+            beat_grid = [round(i * beat_interval, 4) for i in range(int(duration / beat_interval))]
+
+        print(f"Done: {video_id} = {bpm:.1f} BPM, {key_info['camelot']}, {duration:.0f}s", file=sys.stderr)
+
+        return {
+            'video_id': video_id,
+            'duration': duration,
+            'bpm': round(bpm, 2),
+            'beats': [round(b, 4) for b in beats],
+            'beat_grid': beat_grid,
+            'beat_interval': round(beat_interval, 4),
+            'key': key_info,
+            'energy_sections': energy_sections,
+            'transitions': transitions,
+            'genre': genre_energy,
+            'debug': {
+                'bpm_strategies': bpm_debug['strategies'],
+                'chosen_strategy': bpm_debug['chosen_strategy'],
+                'audio_path': audio_path
+            }
         }
-    }
-
-    return result
+    except Exception as e:
+        print(f"Analysis error for {video_id}: {e}", file=sys.stderr)
+        return {'error': str(e), 'video_id': video_id}
 
 
 def analyze_playlist(video_ids, audio_dir):

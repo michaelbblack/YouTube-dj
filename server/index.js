@@ -1,5 +1,5 @@
 const express = require('express');
-const { spawn, execSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
@@ -21,28 +21,52 @@ app.post('/api/playlist', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'URL required' });
 
   try {
-    // Use yt-dlp to get playlist info
-    const result = execSync(
-      `yt-dlp --flat-playlist -J "${url}"`,
-      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
-    );
-    const data = JSON.parse(result.toString());
+    // Use spawnSync with args array to avoid shell interpretation of URL characters (?, &, etc.)
+    const result = spawnSync('yt-dlp', [
+      '--flat-playlist', '-J',
+      '--no-check-certificates',
+      '--no-warnings',
+      url
+    ], { timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    const stderr = result.stderr?.toString() || '';
+    if (result.status !== 0) {
+      throw new Error(stderr || `yt-dlp exited with code ${result.status}`);
+    }
+
+    const data = JSON.parse(result.stdout.toString());
 
     const videos = (data.entries || []).map(entry => ({
       id: entry.id || entry.url,
       title: entry.title || 'Unknown',
       duration: entry.duration || 0,
-      thumbnail: entry.thumbnails?.[0]?.url || `https://img.youtube.com/vi/${entry.id}/mqdefault.jpg`
+      thumbnail: entry.thumbnails?.[0]?.url || `https://img.youtube.com/vi/${entry.id || entry.url}/mqdefault.jpg`
     }));
+
+    if (videos.length === 0) {
+      return res.status(400).json({ error: 'No videos found in playlist. Check the URL.' });
+    }
 
     res.json({ title: data.title || 'Playlist', videos });
   } catch (err) {
-    console.error('Playlist extraction error:', err.message);
-    const isProxy = err.message?.includes('proxy') || err.stderr?.toString().includes('proxy');
-    const isNetwork = err.message?.includes('ECONNREFUSED') || err.message?.includes('ETIMEDOUT') || isProxy;
-    const errorMsg = isNetwork
-      ? 'Cannot reach YouTube (network/proxy blocked). Use the Demo button to try synthetic tracks instead.'
-      : 'Failed to extract playlist. Check the URL and try again.';
+    const errMsg = err.message || '';
+    const errStr = err.stderr?.toString?.() || errMsg;
+    console.error('Playlist extraction error:', errStr);
+
+    let errorMsg;
+    if (errStr.includes('proxy') || errStr.includes('Forbidden') || errStr.includes('Tunnel connection failed')) {
+      errorMsg = 'Cannot reach YouTube (network/proxy blocked). Try the Offline Demo instead.';
+    } else if (errStr.includes('not a valid URL') || errStr.includes('Unsupported URL')) {
+      errorMsg = 'Invalid URL. Paste a YouTube playlist URL (e.g. https://www.youtube.com/playlist?list=...).';
+    } else if (errStr.includes('Private') || errStr.includes('unavailable')) {
+      errorMsg = 'This playlist is private or unavailable.';
+    } else {
+      errorMsg = `Failed to load playlist: ${errStr.slice(0, 200)}`;
+    }
     res.status(500).json({ error: errorMsg });
   }
 });
@@ -56,6 +80,8 @@ app.post('/api/analyze', (req, res) => {
   const cached = [];
   const toAnalyze = [];
   for (const id of videoIds) {
+    // Sanitize video ID (only allow alphanumeric, -, _)
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) continue;
     const cachePath = path.join(ANALYSIS_DIR, `${id}.json`);
     if (fs.existsSync(cachePath)) {
       cached.push(JSON.parse(fs.readFileSync(cachePath, 'utf8')));
@@ -68,49 +94,95 @@ app.post('/api/analyze', (req, res) => {
     return res.json({ tracks: cached });
   }
 
-  // Run Python analysis
+  console.log(`Analyzing ${toAnalyze.length} tracks (${cached.length} cached)...`);
+
+  // Run Python analysis with generous timeout (3 min per track)
+  const timeoutMs = toAnalyze.length * 3 * 60 * 1000;
   const py = spawn('python3', [
     path.join(__dirname, 'analyze.py'),
     toAnalyze.join(','),
     AUDIO_DIR
-  ]);
+  ], { timeout: timeoutMs });
 
   let stdout = '';
   let stderr = '';
+  let responded = false;
 
   py.stdout.on('data', (data) => { stdout += data.toString(); });
   py.stderr.on('data', (data) => {
     stderr += data.toString();
-    // Try to parse progress updates
     const lines = data.toString().split('\n');
     for (const line of lines) {
       if (line.trim()) console.log('[analyze]', line.trim());
     }
   });
 
+  py.on('error', (err) => {
+    if (responded) return;
+    responded = true;
+    console.error('Failed to start analysis:', err.message);
+    res.status(500).json({ error: `Failed to start analysis: ${err.message}` });
+  });
+
   py.on('close', (code) => {
+    if (responded) return;
+    responded = true;
+
     if (code !== 0) {
-      console.error('Analysis failed:', stderr);
-      const isProxy = stderr.includes('proxy') || stderr.includes('Forbidden');
-      const isNetwork = stderr.includes('ECONNREFUSED') || stderr.includes('ETIMEDOUT') || isProxy || stderr.includes('Unable to download');
-      const errorMsg = isNetwork
-        ? 'Cannot download audio from YouTube (network/proxy blocked). Use the Demo button to try with synthetic tracks instead.'
-        : 'Analysis failed';
-      return res.status(500).json({ error: errorMsg, details: stderr });
+      console.error('Analysis process exited with code', code);
+
+      // Even on failure, check if we got partial results
+      let partialResults = [];
+      try {
+        if (stdout.trim()) partialResults = JSON.parse(stdout);
+      } catch (_) {}
+
+      if (partialResults.length > 0) {
+        // Cache whatever succeeded
+        for (const track of partialResults) {
+          if (!track.error) {
+            const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
+            fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
+          }
+        }
+        console.log(`Partial results: ${partialResults.filter(t => !t.error).length} succeeded`);
+        return res.json({ tracks: [...cached, ...partialResults], partial: true });
+      }
+
+      // Complete failure - give specific error
+      let errorMsg = 'Analysis failed';
+      if (stderr.includes('proxy') || stderr.includes('Forbidden') || stderr.includes('Tunnel connection failed')) {
+        errorMsg = 'Cannot download audio from YouTube (network/proxy blocked). Try the Offline Demo instead.';
+      } else if (stderr.includes('ModuleNotFoundError') || stderr.includes('ImportError')) {
+        errorMsg = 'Missing Python dependency. Run: pip install librosa numpy';
+      } else if (stderr.includes('yt-dlp') || stderr.includes('Unable to download')) {
+        errorMsg = 'yt-dlp failed to download audio. Try updating: pip install -U yt-dlp';
+      } else if (stderr.includes('ffmpeg')) {
+        errorMsg = 'ffmpeg is required for audio conversion. Install ffmpeg and try again.';
+      }
+      return res.status(500).json({ error: errorMsg, details: stderr.slice(-500) });
     }
 
     try {
       const results = JSON.parse(stdout);
-      // Cache results
-      for (const track of results) {
-        if (!track.error) {
-          const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
-          fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
-        }
+      const succeeded = results.filter(t => !t.error);
+      const failed = results.filter(t => t.error);
+
+      // Cache successful results
+      for (const track of succeeded) {
+        const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
+        fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
       }
+
+      if (failed.length > 0) {
+        console.warn(`${failed.length} tracks failed analysis:`,
+          failed.map(t => `${t.video_id}: ${t.error}`).join('; '));
+      }
+
       res.json({ tracks: [...cached, ...results] });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to parse analysis results' });
+      console.error('Failed to parse analysis output:', err.message, 'stdout:', stdout.slice(0, 200));
+      res.status(500).json({ error: 'Failed to parse analysis results. Check server logs.' });
     }
   });
 });
