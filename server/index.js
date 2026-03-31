@@ -1,10 +1,11 @@
 const express = require('express');
-const { spawn, spawnSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const YTDlpWrap = require('yt-dlp-wrap-plus').default || require('yt-dlp-wrap-plus');
 const { generateAllDemoData } = require('./demo-generator');
+const { analyzeTracks } = require('./analyze');
 
 const app = express();
 app.use(cors());
@@ -66,7 +67,7 @@ async function ensureYtDlp() {
 }
 
 /**
- * Get the path to the yt-dlp binary (for passing to Python).
+ * Get the path to the yt-dlp binary.
  */
 function getYtDlpBinaryPath() {
   return ytdlp?.getBinaryPath() || 'yt-dlp';
@@ -136,7 +137,7 @@ app.post('/api/playlist', async (req, res) => {
 });
 
 // Analyze tracks - returns analysis results with BPM, key, beats etc.
-app.post('/api/analyze', (req, res) => {
+app.post('/api/analyze', async (req, res) => {
   const { videoIds } = req.body;
   if (!videoIds || !videoIds.length) return res.status(400).json({ error: 'videoIds required' });
 
@@ -164,97 +165,42 @@ app.post('/api/analyze', (req, res) => {
 
   console.log(`Analyzing ${toAnalyze.length} tracks (${cached.length} cached)...`);
 
-  // Pass the yt-dlp binary path to Python so it uses the same binary
-  const binaryPath = getYtDlpBinaryPath();
-  const timeoutMs = toAnalyze.length * 3 * 60 * 1000;
-  const py = spawn('python3', [
-    path.join(__dirname, 'analyze.py'),
-    toAnalyze.join(','),
-    AUDIO_DIR,
-    binaryPath  // Third arg: yt-dlp binary path
-  ], { timeout: timeoutMs });
+  try {
+    const binaryPath = getYtDlpBinaryPath();
+    const results = analyzeTracks(toAnalyze, AUDIO_DIR, binaryPath);
 
-  let stdout = '';
-  let stderr = '';
-  let responded = false;
+    const succeeded = results.filter(t => !t.error);
+    const failed = results.filter(t => t.error);
 
-  py.stdout.on('data', (data) => { stdout += data.toString(); });
-  py.stderr.on('data', (data) => {
-    stderr += data.toString();
-    const lines = data.toString().split('\n');
-    for (const line of lines) {
-      if (line.trim()) console.log('[analyze]', line.trim());
-    }
-  });
-
-  py.on('error', (err) => {
-    if (responded) return;
-    responded = true;
-    console.error('Failed to start analysis:', err.message);
-    res.status(500).json({ error: `Failed to start analysis: ${err.message}` });
-  });
-
-  py.on('close', (code) => {
-    if (responded) return;
-    responded = true;
-
-    if (code !== 0) {
-      console.error('Analysis process exited with code', code);
-
-      // Even on failure, check if we got partial results
-      let partialResults = [];
-      try {
-        if (stdout.trim()) partialResults = JSON.parse(stdout);
-      } catch (_) {}
-
-      if (partialResults.length > 0) {
-        for (const track of partialResults) {
-          if (!track.error) {
-            const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
-            fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
-          }
-        }
-        console.log(`Partial results: ${partialResults.filter(t => !t.error).length} succeeded`);
-        return res.json({ tracks: [...cached, ...partialResults], partial: true });
-      }
-
-      // Complete failure - give specific error
-      let errorMsg = 'Analysis failed';
-      if (stderr.includes('proxy') || stderr.includes('Forbidden') || stderr.includes('Tunnel connection failed')) {
-        errorMsg = 'Cannot download audio from YouTube (network/proxy blocked). Try the Offline Demo instead.';
-      } else if (stderr.includes('ModuleNotFoundError') || stderr.includes('ImportError')) {
-        errorMsg = 'Missing Python dependency. Run: pip install librosa numpy';
-      } else if (stderr.includes('No such file') || stderr.includes('ENOENT')) {
-        errorMsg = 'yt-dlp binary not found. Restart the server to trigger auto-download.';
-      } else if (stderr.includes('Unable to download')) {
-        errorMsg = 'yt-dlp failed to download audio. Check your internet connection.';
-      } else if (stderr.includes('ffmpeg')) {
-        errorMsg = 'ffmpeg is required for audio conversion. Install ffmpeg and try again.';
-      }
-      return res.status(500).json({ error: errorMsg, details: stderr.slice(-500) });
+    // Cache successful results
+    for (const track of succeeded) {
+      const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
+      fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
     }
 
-    try {
-      const results = JSON.parse(stdout);
-      const succeeded = results.filter(t => !t.error);
-      const failed = results.filter(t => t.error);
-
-      for (const track of succeeded) {
-        const cachePath = path.join(ANALYSIS_DIR, `${track.video_id}.json`);
-        fs.writeFileSync(cachePath, JSON.stringify(track, null, 2));
-      }
-
-      if (failed.length > 0) {
-        console.warn(`${failed.length} tracks failed analysis:`,
-          failed.map(t => `${t.video_id}: ${t.error}`).join('; '));
-      }
-
-      res.json({ tracks: [...cached, ...results] });
-    } catch (err) {
-      console.error('Failed to parse analysis output:', err.message, 'stdout:', stdout.slice(0, 200));
-      res.status(500).json({ error: 'Failed to parse analysis results. Check server logs.' });
+    if (failed.length > 0) {
+      console.warn(`${failed.length} tracks failed analysis:`,
+        failed.map(t => `${t.video_id}: ${t.error}`).join('; '));
     }
-  });
+
+    console.log(`Analysis complete: ${succeeded.length} succeeded, ${failed.length} failed`);
+    res.json({ tracks: [...cached, ...results], partial: failed.length > 0 });
+  } catch (err) {
+    console.error('Analysis error:', err.message);
+
+    let errorMsg = 'Analysis failed';
+    const errStr = err.message || '';
+    if (errStr.includes('proxy') || errStr.includes('Forbidden') || errStr.includes('Tunnel connection failed')) {
+      errorMsg = 'Cannot download audio from YouTube (network/proxy blocked). Try the Offline Demo instead.';
+    } else if (errStr.includes('ENOENT')) {
+      errorMsg = 'yt-dlp or ffmpeg binary not found. Restart the server to trigger auto-download.';
+    } else if (errStr.includes('Unable to download')) {
+      errorMsg = 'yt-dlp failed to download audio. Check your internet connection.';
+    } else {
+      errorMsg = `Analysis failed: ${errStr.slice(0, 300)}`;
+    }
+    res.status(500).json({ error: errorMsg });
+  }
 });
 
 // Generate demo data with synthetic audio + analysis (works offline)
