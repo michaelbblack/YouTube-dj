@@ -3,6 +3,7 @@ const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const { generateAllDemoData } = require('./demo-generator');
 
 const app = express();
 app.use(cors());
@@ -37,7 +38,12 @@ app.post('/api/playlist', async (req, res) => {
     res.json({ title: data.title || 'Playlist', videos });
   } catch (err) {
     console.error('Playlist extraction error:', err.message);
-    res.status(500).json({ error: 'Failed to extract playlist. Check the URL.' });
+    const isProxy = err.message?.includes('proxy') || err.stderr?.toString().includes('proxy');
+    const isNetwork = err.message?.includes('ECONNREFUSED') || err.message?.includes('ETIMEDOUT') || isProxy;
+    const errorMsg = isNetwork
+      ? 'Cannot reach YouTube (network/proxy blocked). Use the Demo button to try synthetic tracks instead.'
+      : 'Failed to extract playlist. Check the URL and try again.';
+    res.status(500).json({ error: errorMsg });
   }
 });
 
@@ -85,7 +91,12 @@ app.post('/api/analyze', (req, res) => {
   py.on('close', (code) => {
     if (code !== 0) {
       console.error('Analysis failed:', stderr);
-      return res.status(500).json({ error: 'Analysis failed', details: stderr });
+      const isProxy = stderr.includes('proxy') || stderr.includes('Forbidden');
+      const isNetwork = stderr.includes('ECONNREFUSED') || stderr.includes('ETIMEDOUT') || isProxy || stderr.includes('Unable to download');
+      const errorMsg = isNetwork
+        ? 'Cannot download audio from YouTube (network/proxy blocked). Use the Demo button to try with synthetic tracks instead.'
+        : 'Analysis failed';
+      return res.status(500).json({ error: errorMsg, details: stderr });
     }
 
     try {
@@ -102,6 +113,32 @@ app.post('/api/analyze', (req, res) => {
       res.status(500).json({ error: 'Failed to parse analysis results' });
     }
   });
+});
+
+// Generate demo data with synthetic audio + analysis (works offline)
+app.post('/api/demo', (req, res) => {
+  try {
+    console.log('Generating demo data...');
+    const playlist = generateAllDemoData(AUDIO_DIR, ANALYSIS_DIR);
+
+    // Load analysis data for all demo tracks
+    const tracks = [];
+    for (const track of playlist) {
+      const analysisPath = path.join(ANALYSIS_DIR, `${track.id}.json`);
+      if (fs.existsSync(analysisPath)) {
+        tracks.push(JSON.parse(fs.readFileSync(analysisPath, 'utf8')));
+      }
+    }
+
+    // Generate mix plan
+    const plan = generateMixPlan(tracks);
+
+    res.json({ playlist, tracks, plan });
+    console.log(`Demo data ready: ${playlist.length} synthetic tracks`);
+  } catch (err) {
+    console.error('Demo generation error:', err);
+    res.status(500).json({ error: 'Failed to generate demo data: ' + err.message });
+  }
 });
 
 // Serve cached audio files for Web Audio API playback

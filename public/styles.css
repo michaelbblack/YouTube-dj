@@ -313,6 +313,19 @@ button:disabled { background: #444; cursor: not-allowed; }
   border-radius: 2px;
 }
 
+.demo-thumb {
+  width: 60px;
+  height: 34px;
+  background: linear-gradient(135deg, #1f6feb, #e94560);
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 16px;
+  color: white;
+}
+
 .track-item .title {
   white-space: nowrap;
   overflow: hidden;

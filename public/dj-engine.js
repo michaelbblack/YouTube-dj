@@ -92,8 +92,9 @@ class DJEngine {
 
     this._deckVideoIds[deck] = videoId;
 
-    // Load YouTube video (muted, for visuals)
-    if (player) {
+    // Load YouTube video (muted, for visuals) - skip for synthetic demo tracks
+    const isDemoTrack = videoId.startsWith('demo_');
+    if (player && !isDemoTrack) {
       player.loadVideoById({ videoId, startSeconds: 0 });
       player.pauseVideo();
       player.mute(); // Ensure muted
@@ -129,8 +130,10 @@ class DJEngine {
     // Play audio (source of truth)
     audioDeck.play(startTime);
 
-    // Sync YouTube video to same position
-    if (player) {
+    // Sync YouTube video to same position (skip for demo tracks)
+    const videoId = this._deckVideoIds[deck];
+    const isDemoTrack = videoId?.startsWith('demo_');
+    if (player && !isDemoTrack) {
       if (startTime !== undefined) {
         player.seekTo(startTime, true);
       }
@@ -143,7 +146,10 @@ class DJEngine {
 
   pauseDeck(deck) {
     this.audioDecks[deck]?.pause();
-    this.players[deck]?.pauseVideo();
+    const isDemoTrack = this._deckVideoIds[deck]?.startsWith('demo_');
+    if (!isDemoTrack) {
+      this.players[deck]?.pauseVideo();
+    }
   }
 
   /**
@@ -192,6 +198,8 @@ class DJEngine {
       const player = this.players[deck];
       if (!audioDeck || !player || !audioDeck.isPlaying()) continue;
       if (typeof player.getCurrentTime !== 'function') continue;
+      // Skip sync for demo tracks (no YouTube video)
+      if (this._deckVideoIds[deck]?.startsWith('demo_')) continue;
 
       const audioTime = audioDeck.getCurrentTime();
       const videoTime = player.getCurrentTime();

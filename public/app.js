@@ -228,7 +228,9 @@ setInterval(() => {
 
 function updateDeckUI(deck, track) {
   if (!track) return;
-  document.getElementById(`title-${deck}`).textContent = track.video_id;
+  // Show title from playlist if available, otherwise video ID
+  const playlistTrack = playlist.find(t => t.id === track.video_id);
+  document.getElementById(`title-${deck}`).textContent = playlistTrack?.title || track.video_id;
   document.getElementById(`bpm-${deck}`).textContent = `${track.bpm} BPM`;
   const keyInfo = track.key;
   if (keyInfo) {
@@ -307,16 +309,53 @@ async function loadPlaylist() {
   }
 }
 
-function loadDemo() {
-  playlist = [
-    { id: 'dQw4w9WgXcQ', title: 'Rick Astley - Never Gonna Give You Up', duration: 213 },
-    { id: 'fJ9rUzIMcZQ', title: 'Queen - Bohemian Rhapsody', duration: 354 },
-    { id: 'kJQP7kiw5Fk', title: 'Luis Fonsi - Despacito', duration: 282 },
-    { id: 'JGwWNGJdvx8', title: 'Ed Sheeran - Shape of You', duration: 263 },
-    { id: '09R8_2nJtjg', title: 'Maroon 5 - Sugar', duration: 235 },
-  ];
-  setStatus('Demo playlist loaded (5 tracks)');
-  renderTrackList();
+async function loadDemo() {
+  setStatus('Generating demo tracks (synthetic audio)...');
+  document.getElementById('demo-btn').disabled = true;
+
+  try {
+    const res = await fetch('/api/demo', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to generate demo');
+    }
+
+    const data = await res.json();
+
+    // Set playlist
+    playlist = data.playlist;
+    renderTrackList();
+
+    // Store analysis results
+    for (const track of data.tracks) {
+      analysisData[track.video_id] = track;
+      engine.setTrackData(track.video_id, track);
+    }
+
+    // Set mix plan
+    if (data.plan) {
+      engine.setMixPlan(data.plan);
+
+      // Reorder playlist to match plan
+      const orderedPlaylist = data.plan.order.map(id =>
+        playlist.find(t => t.id === id) || { id, title: id }
+      );
+      playlist = orderedPlaylist;
+      renderTrackList();
+
+      debug.renderTransitions(data.plan, analysisData);
+    }
+
+    setStatus(`Demo ready! ${data.tracks.length} synthetic tracks analyzed and ordered. Hit AUTO MIX!`);
+  } catch (err) {
+    setStatus(`Error: ${err.message}`);
+  } finally {
+    document.getElementById('demo-btn').disabled = false;
+  }
 }
 
 function renderTrackList() {
@@ -337,9 +376,15 @@ function renderTrackList() {
       ? '<span class="status-badge analyzed">OK</span>'
       : '<span class="status-badge pending">--</span>';
 
+    const isDemo = track.id?.startsWith('demo_');
+    const thumbSrc = track.thumbnail || (isDemo ? '' : `https://img.youtube.com/vi/${track.id}/mqdefault.jpg`);
+    const thumbHtml = thumbSrc
+      ? `<img src="${thumbSrc}" alt="" />`
+      : `<div class="demo-thumb">${track.title?.[0] || '?'}</div>`;
+
     div.innerHTML = `
       <span class="order">${i + 1}</span>
-      <img src="https://img.youtube.com/vi/${track.id}/mqdefault.jpg" alt="" />
+      ${thumbHtml}
       <span class="title" title="${track.title}">${track.title}</span>
       <span class="bpm">${bpmText} BPM</span>
       <span class="key">${keyText}</span>
