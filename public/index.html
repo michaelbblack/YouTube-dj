@@ -9,7 +9,9 @@
 <body>
   <div id="app">
     <header>
-      <h1>YouTube DJ <span class="hybrid-badge" title="Web Audio API for precise mixing, YouTube for visuals">HYBRID AUDIO</span></h1>
+      <h1>YouTube DJ <span class="hybrid-badge" title="Web Audio API for precise mixing, YouTube for visuals">HYBRID AUDIO</span>
+        <span class="midi-badge" id="midi-badge" title="No MIDI controller connected" onclick="toggleMidiPanel()">MIDI</span>
+      </h1>
       <div id="playlist-input">
         <input type="text" id="playlist-url" placeholder="Paste YouTube playlist URL..." />
         <button id="load-btn" onclick="loadPlaylist()">Load Playlist</button>
@@ -45,6 +47,11 @@
             <div class="level-meter">
               <div class="level-fill" id="level-a"></div>
             </div>
+          </div>
+          <div class="deck-eq">
+            <div class="eq-knob"><label>HI</label><input type="range" class="eq-slider" id="eq-high-a" min="0" max="200" value="100" oninput="setEQ('a','high',this.value)" /></div>
+            <div class="eq-knob"><label>MID</label><input type="range" class="eq-slider" id="eq-mid-a" min="0" max="200" value="100" oninput="setEQ('a','mid',this.value)" /></div>
+            <div class="eq-knob"><label>LO</label><input type="range" class="eq-slider" id="eq-low-a" min="0" max="200" value="100" oninput="setEQ('a','low',this.value)" /></div>
           </div>
           <div class="deck-controls">
             <input type="range" class="volume-slider" id="vol-a" min="0" max="100" value="100"
@@ -93,6 +100,11 @@
               <div class="level-fill" id="level-b"></div>
             </div>
           </div>
+          <div class="deck-eq">
+            <div class="eq-knob"><label>HI</label><input type="range" class="eq-slider" id="eq-high-b" min="0" max="200" value="100" oninput="setEQ('b','high',this.value)" /></div>
+            <div class="eq-knob"><label>MID</label><input type="range" class="eq-slider" id="eq-mid-b" min="0" max="200" value="100" oninput="setEQ('b','mid',this.value)" /></div>
+            <div class="eq-knob"><label>LO</label><input type="range" class="eq-slider" id="eq-low-b" min="0" max="200" value="100" oninput="setEQ('b','low',this.value)" /></div>
+          </div>
           <div class="deck-controls">
             <input type="range" class="volume-slider" id="vol-b" min="0" max="100" value="100"
               oninput="setVolume('b', this.value)" />
@@ -110,6 +122,26 @@
           <button onclick="toggleDebug()" id="debug-toggle">Debug Panel</button>
         </div>
         <div id="track-list"></div>
+      </div>
+
+      <!-- MIDI Controller Panel -->
+      <div id="midi-panel" class="hidden">
+        <h2>MIDI Controller <span id="midi-device-name">Not connected</span></h2>
+        <div id="midi-status">
+          <p>Connect a MIDI controller (USB or Bluetooth) to use hardware controls.</p>
+          <p id="midi-last-msg"></p>
+        </div>
+        <div id="midi-learn-section">
+          <h3>MIDI Learn</h3>
+          <p>Click a control below, then move the knob/button on your controller to map it.</p>
+          <div id="midi-learn-grid"></div>
+          <div id="midi-learn-status"></div>
+          <button onclick="clearMidiMapping()">Reset All Mappings</button>
+        </div>
+        <div id="midi-mapping-display">
+          <h3>Current Mapping</h3>
+          <div id="midi-mapping-list"></div>
+        </div>
       </div>
 
       <!-- Debug Panel -->
@@ -150,6 +182,7 @@
   <script src="https://www.youtube.com/iframe_api"></script>
   <script src="audio-deck.js"></script>
   <script src="dj-engine.js"></script>
+  <script src="midi-controller.js"></script>
   <script src="debug-tools.js"></script>
   <script src="app.js"></script>
 </body>

@@ -2,7 +2,7 @@
  * AudioDeck - Web Audio API powered audio playback for a single DJ deck.
  *
  * Uses HTML5 <audio> element as source, routed through Web Audio API graph:
- *   <audio> -> MediaElementSource -> GainNode -> AnalyserNode -> destination
+ *   <audio> -> MediaElementSource -> GainNode -> EQ(low/mid/high) -> AnalyserNode -> destination
  *
  * This gives us:
  *   - Arbitrary playbackRate (not limited to YouTube's discrete values)
@@ -27,12 +27,33 @@ class AudioDeck {
     // Web Audio API nodes
     this.sourceNode = null;  // Created once per audio element
     this.gainNode = this.ctx.createGain();
+
+    // 3-band EQ using BiquadFilterNodes
+    this.eqLow = this.ctx.createBiquadFilter();
+    this.eqLow.type = 'lowshelf';
+    this.eqLow.frequency.value = 320;
+    this.eqLow.gain.value = 0; // dB, 0 = flat
+
+    this.eqMid = this.ctx.createBiquadFilter();
+    this.eqMid.type = 'peaking';
+    this.eqMid.frequency.value = 1000;
+    this.eqMid.Q.value = 0.5;
+    this.eqMid.gain.value = 0;
+
+    this.eqHigh = this.ctx.createBiquadFilter();
+    this.eqHigh.type = 'highshelf';
+    this.eqHigh.frequency.value = 3200;
+    this.eqHigh.gain.value = 0;
+
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 2048;
     this.analyser.smoothingTimeConstant = 0.8;
 
-    // Connect: gain -> analyser -> destination
-    this.gainNode.connect(this.analyser);
+    // Connect: gain -> EQ low -> EQ mid -> EQ high -> analyser -> destination
+    this.gainNode.connect(this.eqLow);
+    this.eqLow.connect(this.eqMid);
+    this.eqMid.connect(this.eqHigh);
+    this.eqHigh.connect(this.analyser);
     this.analyser.connect(this.ctx.destination);
 
     // State
@@ -213,6 +234,29 @@ class AudioDeck {
   }
 
   /**
+   * Set 3-band EQ. Value is 0.0-2.0 where 1.0 = flat (no boost/cut).
+   * @param {'low'|'mid'|'high'} band
+   * @param {number} value - 0.0 (full cut, -24dB) to 2.0 (full boost, +24dB), 1.0 = flat
+   */
+  setEQ(band, value) {
+    // Map 0-2 range to -24dB to +24dB
+    const db = (value - 1.0) * 24;
+    const node = band === 'low' ? this.eqLow : band === 'mid' ? this.eqMid : this.eqHigh;
+    node.gain.setValueAtTime(db, this.ctx.currentTime);
+  }
+
+  /**
+   * Get current EQ values as { low, mid, high } in 0-2 range.
+   */
+  getEQ() {
+    return {
+      low: (this.eqLow.gain.value / 24) + 1.0,
+      mid: (this.eqMid.gain.value / 24) + 1.0,
+      high: (this.eqHigh.gain.value / 24) + 1.0,
+    };
+  }
+
+  /**
    * Clean up resources.
    */
   destroy() {
@@ -222,6 +266,9 @@ class AudioDeck {
       this.sourceNode.disconnect();
     }
     this.gainNode.disconnect();
+    this.eqLow.disconnect();
+    this.eqMid.disconnect();
+    this.eqHigh.disconnect();
     this.analyser.disconnect();
   }
 }

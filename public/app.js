@@ -507,6 +507,13 @@ function setCrossfade(value) {
   engine.setCrossfade(parseInt(value));
 }
 
+function setEQ(deck, band, value) {
+  const audioDeck = engine.audioDecks[deck];
+  if (audioDeck) {
+    audioDeck.setEQ(band, parseInt(value) / 100); // slider 0-200 -> 0.0-2.0
+  }
+}
+
 function startAutoMix() {
   if (engine.autoMixing) {
     engine.stopAutoMix();
@@ -548,9 +555,122 @@ function exportMixLog() {
   debug.exportLog();
 }
 
+// ---- MIDI Controller ----
+
+let midiController = null;
+
+async function initMIDI() {
+  midiController = new MIDIController(engine);
+
+  midiController.onConnect = (name) => {
+    const badge = document.getElementById('midi-badge');
+    badge.classList.add('connected');
+    badge.title = `Connected: ${name}`;
+    document.getElementById('midi-device-name').textContent = name;
+    buildMidiLearnGrid();
+    updateMidiMappingDisplay();
+  };
+
+  midiController.onDisconnect = () => {
+    const badge = document.getElementById('midi-badge');
+    badge.classList.remove('connected');
+    badge.title = 'No MIDI controller connected';
+    document.getElementById('midi-device-name').textContent = 'Not connected';
+  };
+
+  midiController.onMIDIMessage = (msg) => {
+    const el = document.getElementById('midi-last-msg');
+    if (el) {
+      const typeStr = msg.type === 0xB0 ? 'CC' : msg.type === 0x90 ? 'Note' : `0x${msg.type.toString(16)}`;
+      el.textContent = `Last: ch${msg.channel} ${typeStr} ${msg.data1} val=${msg.data2}`;
+    }
+  };
+
+  midiController.onLearnComplete = (key, target) => {
+    const el = document.getElementById('midi-learn-status');
+    if (el) el.textContent = `Mapped ${key} -> ${target.action}`;
+    updateMidiMappingDisplay();
+    // Remove active state from learn buttons
+    document.querySelectorAll('.midi-learn-btn.learning').forEach(b => b.classList.remove('learning'));
+  };
+
+  await midiController.init();
+}
+
+function toggleMidiPanel() {
+  const panel = document.getElementById('midi-panel');
+  panel.classList.toggle('hidden');
+}
+
+function buildMidiLearnGrid() {
+  const grid = document.getElementById('midi-learn-grid');
+  if (!grid) return;
+
+  const actions = MIDIController.getActions();
+  grid.innerHTML = '';
+
+  for (const a of actions) {
+    if (a.perDeck) {
+      for (const deck of ['a', 'b']) {
+        const btn = document.createElement('button');
+        btn.className = 'midi-learn-btn';
+        btn.textContent = `${a.label} (${deck.toUpperCase()})`;
+        btn.onclick = () => {
+          document.querySelectorAll('.midi-learn-btn.learning').forEach(b => b.classList.remove('learning'));
+          btn.classList.add('learning');
+          midiController.startLearn({ action: a.action, deck });
+          document.getElementById('midi-learn-status').textContent = `Move a control for: ${a.label} (Deck ${deck.toUpperCase()})`;
+        };
+        grid.appendChild(btn);
+      }
+    } else {
+      const btn = document.createElement('button');
+      btn.className = 'midi-learn-btn';
+      btn.textContent = a.label;
+      btn.onclick = () => {
+        document.querySelectorAll('.midi-learn-btn.learning').forEach(b => b.classList.remove('learning'));
+        btn.classList.add('learning');
+        midiController.startLearn({ action: a.action });
+        document.getElementById('midi-learn-status').textContent = `Move a control for: ${a.label}`;
+      };
+      grid.appendChild(btn);
+    }
+  }
+}
+
+function updateMidiMappingDisplay() {
+  const list = document.getElementById('midi-mapping-list');
+  if (!list || !midiController) return;
+
+  const mapping = midiController.mapping;
+  const entries = Object.entries(mapping);
+
+  if (entries.length === 0) {
+    list.innerHTML = '<p>No mappings configured. Use MIDI Learn above.</p>';
+    return;
+  }
+
+  list.innerHTML = entries.map(([key, val]) => {
+    const [ch, type, num] = key.split(':');
+    const deckStr = val.deck ? ` (Deck ${val.deck.toUpperCase()})` : '';
+    return `<div class="midi-mapping-entry"><code>Ch${ch} ${type.toUpperCase()} ${num}</code> -> <strong>${val.action}${deckStr}</strong></div>`;
+  }).join('');
+}
+
+function clearMidiMapping() {
+  if (midiController) {
+    midiController.clearMapping();
+    updateMidiMappingDisplay();
+  }
+}
+
 // Initialize waveform canvases when DOM is ready
-document.addEventListener('DOMContentLoaded', initWaveformCanvases);
+document.addEventListener('DOMContentLoaded', () => {
+  initWaveformCanvases();
+  initMIDI();
+});
 // Also try immediately in case DOMContentLoaded already fired
 if (document.readyState !== 'loading') {
   initWaveformCanvases();
+  initMIDI();
 }
