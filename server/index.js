@@ -427,7 +427,7 @@ async function start() {
   }
 
   app.listen(PORT, () => {
-    console.log(`YouTube DJ server running on http://localhost:${PORT}`);
+    console.log(`YouTube DJ server running on http://localhost:${PORT} (pure Node.js — no Python)`);
   });
 }
 
