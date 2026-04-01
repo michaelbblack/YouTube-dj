@@ -93,6 +93,14 @@ class MIDIController {
       this._applyDefaultMapping();
     }
 
+    // Hercules handshake: request all current knob/slider positions
+    if (output && this.deviceName.toLowerCase().includes('hercules')) {
+      try {
+        output.send([0xB0, 0x7F, 0x7F]);
+        this.log('Sent Hercules handshake (request knob positions)');
+      } catch {}
+    }
+
     if (this.onConnect) this.onConnect(this.deviceName);
   }
 
@@ -377,58 +385,73 @@ class MIDIController {
   }
 
   /**
-   * Default mapping for Hercules DJControl family.
-   * Based on DJControl Compact/Mix Ultra MIDI protocol:
-   * - Channel 0: shared controls
-   * - Buttons: Note On 0x90 (ch0 for both decks, offset by 0x30 for deck B)
-   * - Knobs/faders: CC 0xB0
+   * Default mapping for Hercules DJControl Mix Ultra.
+   * From Mixxx source code analysis:
+   * - Channel 0 (0xB0/0x90): Master controls
+   * - Channel 1 (0xB1/0x91): Deck A faders/knobs/buttons
+   * - Channel 2 (0xB2/0x92): Deck B faders/knobs/buttons
+   * - Channel 6 (0x96): Deck A performance pads
+   * - Channel 7 (0x97): Deck B performance pads
+   * - Shift moves to channels 4/5 (Deck A/B)
+   * - Jog wheel: CC 9 = pitch bend, CC 10 = scratch (relative, 64 = center)
+   * - Pitch fader: 14-bit via CC 8 (MSB) + CC 40 (LSB)
    */
   _applyHerculesMapping() {
-    // Deck A buttons (channel 0, note on)
-    this.mapping['0:note:33'] = { action: 'play', deck: 'a' };      // 0x21
-    this.mapping['0:note:34'] = { action: 'cue', deck: 'a' };       // 0x22
-    this.mapping['0:note:35'] = { action: 'sync', deck: 'a' };      // 0x23
-    this.mapping['0:note:1']  = { action: 'hotcue1', deck: 'a' };   // 0x01
-    this.mapping['0:note:2']  = { action: 'hotcue2', deck: 'a' };   // 0x02
-    this.mapping['0:note:3']  = { action: 'hotcue3', deck: 'a' };   // 0x03
-    this.mapping['0:note:4']  = { action: 'hotcue4', deck: 'a' };   // 0x04
+    // ---- Master controls (channel 0) ----
+    this.mapping['0:cc:0']   = { action: 'crossfader' };              // Crossfader
+    this.mapping['0:cc:3']   = { action: 'volume', deck: 'a' };      // Master volume (map to deck A vol)
 
-    // Deck B buttons (channel 0, offset 0x30)
-    this.mapping['0:note:81'] = { action: 'play', deck: 'b' };      // 0x51
-    this.mapping['0:note:82'] = { action: 'cue', deck: 'b' };       // 0x52
-    this.mapping['0:note:83'] = { action: 'sync', deck: 'b' };      // 0x53
-    this.mapping['0:note:49'] = { action: 'hotcue1', deck: 'b' };   // 0x31
-    this.mapping['0:note:50'] = { action: 'hotcue2', deck: 'b' };   // 0x32
-    this.mapping['0:note:51'] = { action: 'hotcue3', deck: 'b' };   // 0x33
-    this.mapping['0:note:52'] = { action: 'hotcue4', deck: 'b' };   // 0x34
+    // ---- Deck A buttons (channel 1, note on) ----
+    this.mapping['1:note:7']  = { action: 'play', deck: 'a' };       // Play
+    this.mapping['1:note:6']  = { action: 'cue', deck: 'a' };        // Cue
+    this.mapping['1:note:5']  = { action: 'sync', deck: 'a' };       // Sync
 
-    // Shared controls (channel 0, CC)
-    this.mapping['0:cc:54']  = { action: 'crossfader' };             // 0x36
-    this.mapping['0:note:46'] = { action: 'automix' };               // 0x2E
+    // ---- Deck A faders/knobs (channel 1, CC) ----
+    this.mapping['1:cc:0']    = { action: 'volume', deck: 'a' };     // Volume fader
+    this.mapping['1:cc:2']    = { action: 'eq_low', deck: 'a' };     // EQ Low
+    this.mapping['1:cc:3']    = { action: 'eq_mid', deck: 'a' };     // EQ Mid
+    this.mapping['1:cc:4']    = { action: 'eq_high', deck: 'a' };    // EQ High / Gain
+    this.mapping['1:cc:8']    = { action: 'pitch', deck: 'a' };      // Pitch fader (MSB)
+    this.mapping['1:cc:9']    = { action: 'jog', deck: 'a' };        // Jog wheel (pitch bend mode)
+    this.mapping['1:cc:10']   = { action: 'jog', deck: 'a' };        // Jog wheel (scratch mode)
 
-    // Deck A knobs/faders (channel 0, CC)
-    this.mapping['0:cc:48']  = { action: 'jog', deck: 'a' };        // 0x30
-    this.mapping['0:cc:55']  = { action: 'pitch', deck: 'a' };      // 0x37
-    this.mapping['0:cc:57']  = { action: 'eq_high', deck: 'a' };    // 0x39 (pregain/high)
-    this.mapping['0:cc:59']  = { action: 'eq_mid', deck: 'a' };     // 0x3B
-    this.mapping['0:cc:60']  = { action: 'eq_low', deck: 'a' };     // 0x3C
+    // ---- Deck B buttons (channel 2, note on) ----
+    this.mapping['2:note:7']  = { action: 'play', deck: 'b' };       // Play
+    this.mapping['2:note:6']  = { action: 'cue', deck: 'b' };        // Cue
+    this.mapping['2:note:5']  = { action: 'sync', deck: 'b' };       // Sync
 
-    // Deck B knobs/faders (channel 0, CC)
-    this.mapping['0:cc:49']  = { action: 'jog', deck: 'b' };        // 0x31
-    this.mapping['0:cc:56']  = { action: 'pitch', deck: 'b' };      // 0x38
-    this.mapping['0:cc:61']  = { action: 'eq_high', deck: 'b' };    // 0x3D (pregain/high)
-    this.mapping['0:cc:63']  = { action: 'eq_mid', deck: 'b' };     // 0x3F
-    this.mapping['0:cc:64']  = { action: 'eq_low', deck: 'b' };     // 0x40
+    // ---- Deck B faders/knobs (channel 2, CC) ----
+    this.mapping['2:cc:0']    = { action: 'volume', deck: 'b' };     // Volume fader
+    this.mapping['2:cc:2']    = { action: 'eq_low', deck: 'b' };     // EQ Low
+    this.mapping['2:cc:3']    = { action: 'eq_mid', deck: 'b' };     // EQ Mid
+    this.mapping['2:cc:4']    = { action: 'eq_high', deck: 'b' };    // EQ High / Gain
+    this.mapping['2:cc:8']    = { action: 'pitch', deck: 'b' };      // Pitch fader (MSB)
+    this.mapping['2:cc:9']    = { action: 'jog', deck: 'b' };        // Jog wheel (pitch bend mode)
+    this.mapping['2:cc:10']   = { action: 'jog', deck: 'b' };        // Jog wheel (scratch mode)
 
-    // Also try channel 1/2 layout (Mix Ultra uses channels per deck)
-    this.mapping['1:note:5']  = { action: 'sync', deck: 'a' };
-    this.mapping['1:cc:4']    = { action: 'eq_high', deck: 'a' };
-    this.mapping['1:cc:3']    = { action: 'eq_mid', deck: 'a' };
-    this.mapping['1:cc:2']    = { action: 'eq_low', deck: 'a' };
-    this.mapping['2:note:5']  = { action: 'sync', deck: 'b' };
-    this.mapping['2:cc:4']    = { action: 'eq_high', deck: 'b' };
-    this.mapping['2:cc:3']    = { action: 'eq_mid', deck: 'b' };
-    this.mapping['2:cc:2']    = { action: 'eq_low', deck: 'b' };
+    // ---- Performance pads - Deck A (channel 6) ----
+    this.mapping['6:note:0']  = { action: 'hotcue1', deck: 'a' };    // Hot Cue 1
+    this.mapping['6:note:1']  = { action: 'hotcue2', deck: 'a' };    // Hot Cue 2
+    this.mapping['6:note:2']  = { action: 'hotcue3', deck: 'a' };    // Hot Cue 3
+    this.mapping['6:note:3']  = { action: 'hotcue4', deck: 'a' };    // Hot Cue 4
+
+    // ---- Performance pads - Deck B (channel 7) ----
+    this.mapping['7:note:0']  = { action: 'hotcue1', deck: 'b' };    // Hot Cue 1
+    this.mapping['7:note:1']  = { action: 'hotcue2', deck: 'b' };    // Hot Cue 2
+    this.mapping['7:note:2']  = { action: 'hotcue3', deck: 'b' };    // Hot Cue 3
+    this.mapping['7:note:3']  = { action: 'hotcue4', deck: 'b' };    // Hot Cue 4
+
+    // ---- Also map DJControl Compact layout (channel 0 for everything) ----
+    // This ensures compatibility with older Hercules controllers
+    this.mapping['0:note:33'] = { action: 'play', deck: 'a' };       // 0x21
+    this.mapping['0:note:34'] = { action: 'cue', deck: 'a' };        // 0x22
+    this.mapping['0:note:35'] = { action: 'sync', deck: 'a' };       // 0x23
+    this.mapping['0:note:81'] = { action: 'play', deck: 'b' };       // 0x51
+    this.mapping['0:note:82'] = { action: 'cue', deck: 'b' };        // 0x52
+    this.mapping['0:note:83'] = { action: 'sync', deck: 'b' };       // 0x53
+    this.mapping['0:cc:54']   = { action: 'crossfader' };             // 0x36
+    this.mapping['0:cc:48']   = { action: 'jog', deck: 'a' };        // 0x30
+    this.mapping['0:cc:49']   = { action: 'jog', deck: 'b' };        // 0x31
   }
 
   /**
