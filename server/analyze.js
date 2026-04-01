@@ -1,7 +1,7 @@
 /**
  * Audio analysis pipeline for YouTube DJ — pure Node.js.
  * No Python, no librosa, no system ffmpeg needed.
- * Uses ffmpeg-static (npm) for conversion + custom DSP for analysis.
+ * Uses system ffmpeg (or ffmpeg-static) for conversion + custom DSP for analysis.
  */
 
 const { spawnSync } = require('child_process');
@@ -17,10 +17,76 @@ try {
   ffmpegPath = 'ffmpeg';
 }
 
+// ---- FFT Implementation (Cooley-Tukey radix-2) ----
+
+/**
+ * In-place radix-2 FFT. Arrays real/imag are modified in place.
+ * n must be a power of 2.
+ */
+function fft(real, imag, n) {
+  // Bit-reversal permutation
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    while (j & bit) {
+      j ^= bit;
+      bit >>= 1;
+    }
+    j ^= bit;
+    if (i < j) {
+      let tmp = real[i]; real[i] = real[j]; real[j] = tmp;
+      tmp = imag[i]; imag[i] = imag[j]; imag[j] = tmp;
+    }
+  }
+
+  // Cooley-Tukey butterfly
+  for (let len = 2; len <= n; len *= 2) {
+    const halfLen = len / 2;
+    const angle = -2 * Math.PI / len;
+    const wRe = Math.cos(angle);
+    const wIm = Math.sin(angle);
+
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let j = 0; j < halfLen; j++) {
+        const a = i + j;
+        const b = i + j + halfLen;
+        const tRe = curRe * real[b] - curIm * imag[b];
+        const tIm = curRe * imag[b] + curIm * real[b];
+        real[b] = real[a] - tRe;
+        imag[b] = imag[a] - tIm;
+        real[a] += tRe;
+        imag[a] += tIm;
+        const nextRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe;
+      }
+    }
+  }
+}
+
+/**
+ * Compute magnitude spectrum using FFT. Returns Float32Array of magnitudes (first half).
+ */
+function fftMagnitude(frame, fftSize) {
+  const real = new Float32Array(fftSize);
+  const imag = new Float32Array(fftSize);
+  for (let i = 0; i < frame.length && i < fftSize; i++) {
+    real[i] = frame[i];
+  }
+  fft(real, imag, fftSize);
+
+  const halfN = fftSize / 2;
+  const mag = new Float32Array(halfN);
+  for (let i = 0; i < halfN; i++) {
+    mag[i] = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
+  }
+  return mag;
+}
+
 // ---- Audio download & conversion ----
 
 /**
- * Download audio from YouTube and convert to 44.1kHz mono WAV.
+ * Download audio from YouTube and convert to 22050Hz mono WAV (lower rate = faster analysis).
  */
 function downloadAudio(videoId, audioDir, ytDlpBinary) {
   const outputPath = path.join(audioDir, `${videoId}.wav`);
@@ -74,11 +140,11 @@ function downloadAudio(videoId, audioDir, ytDlpBinary) {
     return null;
   }
 
-  // Convert to mono 44.1kHz WAV using ffmpeg-static
+  // Convert to mono 22050Hz WAV (lower sample rate = faster analysis, fine for BPM/key)
   if (srcFile !== outputPath) {
     console.log(`Converting to WAV for ${videoId}...`);
     const ffResult = spawnSync(ffmpegPath, [
-      '-i', srcFile, '-ar', '44100', '-ac', '1', '-y', outputPath
+      '-i', srcFile, '-ar', '22050', '-ac', '1', '-y', outputPath
     ], { timeout: 120000 });
 
     // Clean up source file
@@ -111,113 +177,49 @@ function loadWav(filePath) {
   const buffer = fs.readFileSync(filePath);
   const decoded = wavDecoder.decode.sync(buffer);
   return {
-    samples: decoded.channelData[0], // Mono (first channel)
+    samples: decoded.channelData[0],
     sampleRate: decoded.sampleRate,
     duration: decoded.channelData[0].length / decoded.sampleRate,
   };
 }
 
-// ---- DSP helpers ----
-
-/**
- * Compute RMS energy in windows.
- */
-function computeRMS(samples, windowSize) {
-  const result = [];
-  for (let i = 0; i < samples.length; i += windowSize) {
-    let sum = 0;
-    const end = Math.min(i + windowSize, samples.length);
-    for (let j = i; j < end; j++) {
-      sum += samples[j] * samples[j];
-    }
-    result.push(Math.sqrt(sum / (end - i)));
-  }
-  return result;
-}
-
-/**
- * Compute spectral centroid for each window (brightness measure).
- */
-function computeSpectralCentroid(samples, sampleRate, windowSize) {
-  const centroids = [];
-  const fftSize = windowSize;
-
-  for (let i = 0; i < samples.length; i += windowSize) {
-    const end = Math.min(i + fftSize, samples.length);
-    const frame = new Float32Array(fftSize);
-    for (let j = 0; j < end - i; j++) {
-      // Hann window
-      const w = 0.5 * (1 - Math.cos(2 * Math.PI * j / (fftSize - 1)));
-      frame[j] = samples[i + j] * w;
-    }
-
-    // Compute magnitude spectrum via DFT (simplified for centroid)
-    const halfN = Math.floor(fftSize / 2);
-    let weightedSum = 0;
-    let magSum = 0;
-
-    for (let k = 1; k < halfN; k++) {
-      let re = 0, im = 0;
-      for (let n = 0; n < fftSize; n++) {
-        const angle = -2 * Math.PI * k * n / fftSize;
-        re += frame[n] * Math.cos(angle);
-        im += frame[n] * Math.sin(angle);
-      }
-      const mag = Math.sqrt(re * re + im * im);
-      const freq = k * sampleRate / fftSize;
-      weightedSum += freq * mag;
-      magSum += mag;
-    }
-
-    centroids.push(magSum > 0 ? weightedSum / magSum : 0);
-  }
-  return centroids;
-}
-
 // ---- BPM detection ----
 
 /**
- * Detect BPM using onset strength autocorrelation.
+ * Detect BPM using onset strength autocorrelation (FFT-based).
  */
 function detectBPM(samples, sampleRate) {
   const hopSize = 512;
-  const windowSize = 1024;
+  const fftSize = 1024;
+  const halfN = fftSize / 2;
 
-  // Compute onset strength (spectral flux)
+  // Compute onset strength (spectral flux) using FFT
   const onsetStrength = [];
-  let prevSpectrum = null;
+  let prevMag = null;
+  const hannWindow = new Float32Array(fftSize);
+  for (let j = 0; j < fftSize; j++) {
+    hannWindow[j] = 0.5 * (1 - Math.cos(2 * Math.PI * j / (fftSize - 1)));
+  }
 
-  for (let i = 0; i < samples.length - windowSize; i += hopSize) {
-    const frame = new Float32Array(windowSize);
-    for (let j = 0; j < windowSize; j++) {
-      const w = 0.5 * (1 - Math.cos(2 * Math.PI * j / (windowSize - 1)));
-      frame[j] = (samples[i + j] || 0) * w;
+  for (let i = 0; i < samples.length - fftSize; i += hopSize) {
+    const frame = new Float32Array(fftSize);
+    for (let j = 0; j < fftSize; j++) {
+      frame[j] = (samples[i + j] || 0) * hannWindow[j];
     }
 
-    // Compute magnitude spectrum (first 256 bins)
-    const nBins = Math.floor(windowSize / 2);
-    const spectrum = new Float32Array(nBins);
-    for (let k = 0; k < nBins; k++) {
-      let re = 0, im = 0;
-      for (let n = 0; n < windowSize; n++) {
-        const angle = -2 * Math.PI * k * n / windowSize;
-        re += frame[n] * Math.cos(angle);
-        im += frame[n] * Math.sin(angle);
-      }
-      spectrum[k] = Math.sqrt(re * re + im * im);
-    }
+    const mag = fftMagnitude(frame, fftSize);
 
-    if (prevSpectrum) {
+    if (prevMag) {
       let flux = 0;
-      for (let k = 0; k < nBins; k++) {
-        const diff = spectrum[k] - prevSpectrum[k];
+      for (let k = 0; k < halfN; k++) {
+        const diff = mag[k] - prevMag[k];
         if (diff > 0) flux += diff;
       }
       onsetStrength.push(flux);
     } else {
       onsetStrength.push(0);
     }
-    prevSpectrum = spectrum;
+    prevMag = mag;
   }
 
   // Autocorrelation of onset strength
@@ -232,12 +234,11 @@ function detectBPM(samples, sampleRate) {
 
   for (let lag = minLag; lag <= Math.min(maxLag, N - 1); lag++) {
     let corr = 0;
-    let count = 0;
-    for (let i = 0; i < N - lag; i++) {
+    const limit = Math.min(N - lag, 2000); // Cap correlation length for speed
+    for (let i = 0; i < limit; i++) {
       corr += onsetStrength[i] * onsetStrength[i + lag];
-      count++;
     }
-    corr = count > 0 ? corr / count : 0;
+    corr /= limit;
 
     const bpm = (onsetRate * 60) / lag;
     if (corr > bestCorr) {
@@ -246,9 +247,8 @@ function detectBPM(samples, sampleRate) {
     }
   }
 
-  // Also check double/half to pick the most common octave
+  // Check double/half to pick the most common octave
   const candidates = [bestBPM, bestBPM * 2, bestBPM / 2].filter(b => b >= 70 && b <= 180);
-  // Prefer the one closest to common dance music range (110-140)
   candidates.sort((a, b) => Math.abs(a - 125) - Math.abs(b - 125));
 
   return Math.round(candidates[0] * 100) / 100;
@@ -311,39 +311,35 @@ function computeBeatGrid(samples, sampleRate, bpm) {
 // ---- Key detection ----
 
 /**
- * Detect musical key using chroma features and Krumhansl-Kessler profiles.
+ * Detect musical key using chroma features (FFT-based) and Krumhansl-Kessler profiles.
  */
 function detectKey(samples, sampleRate) {
-  // Compute chroma (12 pitch classes) by binning DFT into semitones
   const chroma = new Float32Array(12);
-  const windowSize = 8192;
-  const hopSize = 4096;
+  const fftSize = 4096; // Power of 2 for FFT
+  const hopSize = fftSize; // Non-overlapping for speed
   let windowCount = 0;
 
-  for (let i = 0; i < samples.length - windowSize; i += hopSize) {
-    const frame = new Float32Array(windowSize);
-    for (let j = 0; j < windowSize; j++) {
-      const w = 0.5 * (1 - Math.cos(2 * Math.PI * j / (windowSize - 1)));
-      frame[j] = samples[i + j] * w;
+  const hannWindow = new Float32Array(fftSize);
+  for (let j = 0; j < fftSize; j++) {
+    hannWindow[j] = 0.5 * (1 - Math.cos(2 * Math.PI * j / (fftSize - 1)));
+  }
+
+  for (let i = 0; i < samples.length - fftSize; i += hopSize) {
+    const frame = new Float32Array(fftSize);
+    for (let j = 0; j < fftSize; j++) {
+      frame[j] = samples[i + j] * hannWindow[j];
     }
 
-    // DFT magnitude for relevant frequency bins
-    for (let k = 1; k < windowSize / 2; k++) {
-      const freq = k * sampleRate / windowSize;
-      if (freq < 65 || freq > 2000) continue; // Musical range: C2 to B6
+    const mag = fftMagnitude(frame, fftSize);
 
-      let re = 0, im = 0;
-      for (let n = 0; n < windowSize; n++) {
-        const angle = -2 * Math.PI * k * n / windowSize;
-        re += frame[n] * Math.cos(angle);
-        im += frame[n] * Math.sin(angle);
-      }
-      const mag = re * re + im * im; // Squared magnitude (skip sqrt for speed)
+    // Map FFT bins to chroma
+    for (let k = 1; k < fftSize / 2; k++) {
+      const freq = k * sampleRate / fftSize;
+      if (freq < 65 || freq > 2000) continue;
 
-      // Map frequency to chroma bin (0=C, 1=C#, ..., 11=B)
-      const semitone = 12 * Math.log2(freq / 261.63); // Reference: middle C
+      const semitone = 12 * Math.log2(freq / 261.63);
       const chromaBin = ((Math.round(semitone) % 12) + 12) % 12;
-      chroma[chromaBin] += mag;
+      chroma[chromaBin] += mag[k] * mag[k]; // Use power spectrum
     }
     windowCount++;
   }
@@ -363,7 +359,6 @@ function detectKey(samples, sampleRate) {
   let bestMode = 'major';
 
   for (let i = 0; i < 12; i++) {
-    // Rotate chroma to test key i
     const rotated = new Float32Array(12);
     for (let j = 0; j < 12; j++) {
       rotated[j] = chroma[(j + i) % 12];
@@ -414,8 +409,13 @@ function pearsonCorrelation(x, y) {
 function analyzeEnergyProfile(samples, sampleRate) {
   const sectionDuration = 4; // seconds
   const sectionSamples = sectionDuration * sampleRate;
+  const fftSize = 2048;
 
-  const windowSize = 2048;
+  const hannWindow = new Float32Array(fftSize);
+  for (let j = 0; j < fftSize; j++) {
+    hannWindow[j] = 0.5 * (1 - Math.cos(2 * Math.PI * j / (fftSize - 1)));
+  }
+
   const sections = [];
 
   for (let i = 0; i < samples.length; i += sectionSamples) {
@@ -426,29 +426,23 @@ function analyzeEnergyProfile(samples, sampleRate) {
     }
     const rms = Math.sqrt(sumSq / (end - i));
 
-    // Simple spectral centroid for this section
+    // Spectral centroid for brightness using FFT
+    const frameEnd = Math.min(i + fftSize, samples.length);
+    const frame = new Float32Array(fftSize);
+    for (let j = 0; j < frameEnd - i && j < fftSize; j++) {
+      frame[j] = samples[i + j] * hannWindow[j];
+    }
+    const mag = fftMagnitude(frame, fftSize);
+
     let weightedSum = 0, magSum = 0;
-    const frameStart = i;
-    const frameEnd = Math.min(i + windowSize, samples.length);
-    for (let k = 1; k < windowSize / 4; k++) {
-      let re = 0, im = 0;
-      for (let n = frameStart; n < frameEnd; n++) {
-        const angle = -2 * Math.PI * k * (n - frameStart) / windowSize;
-        re += samples[n] * Math.cos(angle);
-        im += samples[n] * Math.sin(angle);
-      }
-      const mag = Math.sqrt(re * re + im * im);
-      const freq = k * sampleRate / windowSize;
-      weightedSum += freq * mag;
-      magSum += mag;
+    for (let k = 1; k < fftSize / 2; k++) {
+      const freq = k * sampleRate / fftSize;
+      weightedSum += freq * mag[k];
+      magSum += mag[k];
     }
     const brightness = magSum > 0 ? weightedSum / magSum : 0;
 
-    sections.push({
-      time: i / sampleRate,
-      energy: rms,
-      brightness,
-    });
+    sections.push({ time: i / sampleRate, energy: rms, brightness });
   }
 
   // Normalize energy
@@ -473,11 +467,9 @@ function findTransitionPoints(beats, energySections, duration) {
 
   const lowEnergyTimes = times.filter((t, i) => energies[i] < avgEnergy * 0.6);
 
-  // Mix-in: first low-energy point in first 30% of track
   let mixIn = 0;
   for (const t of lowEnergyTimes) {
     if (t > 4 && t < duration * 0.3) {
-      // Snap to nearest beat
       let nearestBeat = beats[0];
       for (const b of beats) {
         if (Math.abs(b - t) < Math.abs(nearestBeat - t)) nearestBeat = b;
@@ -487,7 +479,6 @@ function findTransitionPoints(beats, energySections, duration) {
     }
   }
 
-  // Mix-out: last low-energy point in last 40%
   let mixOut = duration * 0.85;
   for (let i = lowEnergyTimes.length - 1; i >= 0; i--) {
     const t = lowEnergyTimes[i];
@@ -501,7 +492,6 @@ function findTransitionPoints(beats, energySections, duration) {
     }
   }
 
-  // Classify segments
   const segments = energySections.map((sec, i) => {
     let type;
     if (sec.energy_norm < 0.3) type = 'breakdown';
@@ -528,11 +518,7 @@ function estimateGenre(energySections) {
   else if (avgBrightness < 2000) genreHint = 'hip-hop/r&b';
   else genreHint = 'pop';
 
-  return {
-    genre_hint: genreHint,
-    spectral_centroid: avgBrightness,
-    rms_energy: avgEnergy,
-  };
+  return { genre_hint: genreHint, spectral_centroid: avgBrightness, rms_energy: avgEnergy };
 }
 
 // ---- Main analysis function ----
@@ -556,7 +542,7 @@ function analyzeTrack(videoId, audioDir, ytDlpBinary) {
       return { error: `Audio too short (${duration.toFixed(1)}s)`, video_id: videoId };
     }
 
-    console.log(`Detecting BPM for ${videoId}...`);
+    console.log(`Detecting BPM for ${videoId} (${duration.toFixed(0)}s @ ${sampleRate}Hz)...`);
     const bpm = detectBPM(samples, sampleRate);
 
     console.log(`Detecting key for ${videoId}...`);
@@ -576,7 +562,7 @@ function analyzeTrack(videoId, audioDir, ytDlpBinary) {
       video_id: videoId,
       duration,
       bpm,
-      beats: beatGrid.slice(0, 200), // First 200 detected beats
+      beats: beatGrid.slice(0, 200),
       beat_grid: beatGrid,
       beat_interval: Math.round(beatInterval * 10000) / 10000,
       key: keyInfo,
@@ -596,16 +582,32 @@ function analyzeTrack(videoId, audioDir, ytDlpBinary) {
 }
 
 /**
- * Analyze multiple tracks.
+ * Analyze multiple tracks asynchronously (doesn't block event loop).
+ * Returns a Promise that resolves with results array.
  */
 function analyzeTracks(videoIds, audioDir, ytDlpBinary) {
-  const results = [];
-  for (const id of videoIds) {
-    const result = analyzeTrack(id, audioDir, ytDlpBinary);
-    results.push(result);
-    console.log(`Progress: ${results.length}/${videoIds.length}`);
-  }
-  return results;
+  return new Promise((resolve) => {
+    const results = [];
+    let index = 0;
+
+    function next() {
+      if (index >= videoIds.length) {
+        resolve(results);
+        return;
+      }
+
+      const id = videoIds[index++];
+      const result = analyzeTrack(id, audioDir, ytDlpBinary);
+      results.push(result);
+      console.log(`Progress: ${results.length}/${videoIds.length}`);
+
+      // Yield to event loop between tracks so HTTP responses can flow
+      setImmediate(next);
+    }
+
+    // Start on next tick so the caller can set up response handling
+    setImmediate(next);
+  });
 }
 
 module.exports = { analyzeTrack, analyzeTracks };

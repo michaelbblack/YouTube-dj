@@ -167,7 +167,7 @@ app.post('/api/analyze', async (req, res) => {
 
   try {
     const binaryPath = getYtDlpBinaryPath();
-    const results = analyzeTracks(toAnalyze, AUDIO_DIR, binaryPath);
+    const results = await analyzeTracks(toAnalyze, AUDIO_DIR, binaryPath);
 
     const succeeded = results.filter(t => !t.error);
     const failed = results.filter(t => t.error);
