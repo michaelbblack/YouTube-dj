@@ -90,28 +90,69 @@ function fftMagnitude(frame, fftSize) {
  */
 function downloadAudio(videoId, audioDir, ytDlpBinary) {
   const outputPath = path.join(audioDir, `${videoId}.wav`);
-  if (fs.existsSync(outputPath)) return outputPath;
+  if (fs.existsSync(outputPath)) {
+    // Verify file isn't empty/corrupt
+    const stat = fs.statSync(outputPath);
+    if (stat.size > 1000) {
+      console.log(`Using cached audio for ${videoId} (${(stat.size / 1024 / 1024).toFixed(1)}MB)`);
+      return outputPath;
+    }
+    // Remove corrupt cache
+    fs.unlinkSync(outputPath);
+  }
 
   const tempPath = path.join(audioDir, `${videoId}_temp`);
   console.log(`Downloading audio for ${videoId}...`);
 
-  // Download best audio
-  const dlResult = spawnSync(ytDlpBinary, [
+  // Verify ffmpeg is available first
+  const ffCheck = spawnSync(ffmpegPath, ['-version'], { timeout: 5000 });
+  if (ffCheck.status !== 0 && ffCheck.error) {
+    console.error(`ffmpeg not found at ${ffmpegPath}:`, ffCheck.error?.message);
+    return { error: `ffmpeg not available: ${ffCheck.error?.message}` };
+  }
+  console.log(`Using ffmpeg: ${ffmpegPath}`);
+
+  // Download best audio with ffmpeg location specified
+  const ffmpegDir = path.dirname(ffmpegPath === 'ffmpeg' ? '/usr/bin/ffmpeg' : ffmpegPath);
+  const dlArgs = [
     '-x',
     '--audio-quality', '0',
     '--no-check-certificates',
     '--no-playlist',
     '--retries', '3',
     '--socket-timeout', '30',
+    '--verbose',
     '-o', `${tempPath}.%(ext)s`,
     `https://www.youtube.com/watch?v=${videoId}`
-  ], { timeout: 180000 });
+  ];
+  // Only add --ffmpeg-location if ffmpeg isn't on system PATH
+  if (ffmpegPath !== 'ffmpeg') {
+    dlArgs.splice(0, 0, '--ffmpeg-location', ffmpegDir);
+  }
+
+  console.log(`Running: ${ytDlpBinary} ${dlArgs.join(' ')}`);
+  const dlResult = spawnSync(ytDlpBinary, dlArgs, {
+    timeout: 300000, // 5 minutes per track
+    maxBuffer: 10 * 1024 * 1024,
+  });
+
+  const dlStdout = dlResult.stdout?.toString() || '';
+  const dlStderr = dlResult.stderr?.toString() || '';
+
+  if (dlStdout) console.log(`yt-dlp stdout for ${videoId}:`, dlStdout.slice(-500));
+  if (dlStderr) console.log(`yt-dlp stderr for ${videoId}:`, dlStderr.slice(-500));
+
+  if (dlResult.error) {
+    console.error(`yt-dlp spawn error for ${videoId}:`, dlResult.error.message);
+    cleanupTemp(tempPath);
+    return { error: `yt-dlp spawn error: ${dlResult.error.message}` };
+  }
 
   if (dlResult.status !== 0) {
-    const err = dlResult.stderr?.toString() || 'unknown error';
-    console.error(`yt-dlp error for ${videoId}:`, err.slice(0, 300));
+    const combined = dlStdout + dlStderr;
+    console.error(`yt-dlp exited ${dlResult.status} for ${videoId}`);
     cleanupTemp(tempPath);
-    return null;
+    return { error: `yt-dlp failed (exit ${dlResult.status}): ${combined.slice(-300)}` };
   }
 
   // Find the downloaded file
@@ -129,16 +170,26 @@ function downloadAudio(videoId, audioDir, ytDlpBinary) {
   if (!srcFile) {
     const dir = path.dirname(tempPath);
     const base = path.basename(tempPath);
-    const files = fs.readdirSync(dir).filter(f => f.startsWith(base));
-    if (files.length > 0) {
-      srcFile = path.join(dir, files[0]);
-    }
+    try {
+      const files = fs.readdirSync(dir).filter(f => f.startsWith(base));
+      if (files.length > 0) {
+        srcFile = path.join(dir, files[0]);
+        console.log(`Found audio via glob: ${srcFile}`);
+      }
+    } catch {}
   }
 
   if (!srcFile) {
-    console.error(`No audio file found for ${videoId}`);
-    return null;
+    // List audio_cache to help debug
+    try {
+      const dir = path.dirname(tempPath);
+      const allFiles = fs.readdirSync(dir);
+      console.error(`No audio file found for ${videoId}. Files in ${dir}:`, allFiles.slice(0, 20));
+    } catch {}
+    return { error: `No audio file found after download for ${videoId}` };
   }
+
+  console.log(`Downloaded: ${srcFile} (${(fs.statSync(srcFile).size / 1024).toFixed(0)}KB)`);
 
   // Convert to mono 22050Hz WAV (lower sample rate = faster analysis, fine for BPM/key)
   if (srcFile !== outputPath) {
@@ -150,13 +201,20 @@ function downloadAudio(videoId, audioDir, ytDlpBinary) {
     // Clean up source file
     try { fs.unlinkSync(srcFile); } catch {}
 
-    if (ffResult.status !== 0) {
-      console.error(`ffmpeg error for ${videoId}:`, ffResult.stderr?.toString().slice(0, 200));
-      return null;
+    if (ffResult.status !== 0 || ffResult.error) {
+      const ffErr = ffResult.stderr?.toString() || ffResult.error?.message || 'unknown';
+      console.error(`ffmpeg error for ${videoId}:`, ffErr.slice(0, 300));
+      return { error: `ffmpeg conversion failed: ${ffErr.slice(0, 200)}` };
     }
   }
 
-  return fs.existsSync(outputPath) ? outputPath : null;
+  if (!fs.existsSync(outputPath)) {
+    return { error: 'WAV file not created after conversion' };
+  }
+
+  const size = fs.statSync(outputPath).size;
+  console.log(`Converted: ${outputPath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
+  return outputPath;
 }
 
 function cleanupTemp(tempPath) {
@@ -530,11 +588,16 @@ function analyzeTrack(videoId, audioDir, ytDlpBinary) {
   console.log(`Analyzing ${videoId}...`);
 
   try {
-    const audioPath = downloadAudio(videoId, audioDir, ytDlpBinary);
-    if (!audioPath) {
-      return { error: `Failed to download audio for ${videoId}`, video_id: videoId };
+    const audioResult = downloadAudio(videoId, audioDir, ytDlpBinary);
+
+    // downloadAudio returns string path on success, or { error } on failure
+    if (!audioResult || typeof audioResult === 'object') {
+      const errMsg = audioResult?.error || `Failed to download audio for ${videoId}`;
+      console.error(`Download failed for ${videoId}: ${errMsg}`);
+      return { error: errMsg, video_id: videoId };
     }
 
+    const audioPath = audioResult;
     console.log(`Loading audio for ${videoId}...`);
     const { samples, sampleRate, duration } = loadWav(audioPath);
 

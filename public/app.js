@@ -447,11 +447,18 @@ async function analyzeAll() {
 
     const data = await res.json();
 
+    let successCount = 0;
+    let failCount = 0;
+    let lastError = '';
     for (const track of data.tracks) {
       if (!track.error) {
         analysisData[track.video_id] = track;
         engine.setTrackData(track.video_id, track);
+        successCount++;
       } else {
+        failCount++;
+        lastError = track.error;
+        console.error(`Analysis failed for ${track.video_id}: ${track.error}`);
         debug.log({ time: new Date().toISOString(), type: 'error', message: `Analysis failed for ${track.video_id}: ${track.error}` });
       }
     }
@@ -460,9 +467,11 @@ async function analyzeAll() {
     renderTrackList();
 
     // Generate mix plan
-    setStatus('Generating mix plan...');
     const analyzedTracks = Object.values(analysisData);
-    if (analyzedTracks.length >= 2) {
+    if (failCount > 0 && successCount === 0) {
+      setStatus(`All ${failCount} tracks failed analysis. Error: ${lastError.slice(0, 200)}`);
+    } else if (analyzedTracks.length >= 2) {
+      setStatus('Generating mix plan...');
       const planRes = await fetch('/api/mixplan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
